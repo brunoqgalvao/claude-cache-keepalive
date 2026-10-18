@@ -419,7 +419,7 @@ def classify(ep, now, pol, proc_start):
         elif proc_start and ep['start'] < proc_start < ep['start'] + TTL:
             why = f"not tracked: opencodex restarted at {hm(proc_start)}"
         else:
-            why = 'never checked: no keep-alive timer for it (restart, older version, or a last request that ended abnormally)'
+            why = 'never checked: the keep-alive had no timer for it, usually because another chat with the same keep-alive key replaced it'
         story = (f"{kept + ', then ' if n else ''}{why}. You came back {away} and rewrote the cache; "
                  f"{need_n} keep-alive{'s' if need_n != 1 else ''} ({fmt_tok(need_n * ep['unit'])}) would have saved {fmt_tok(best)}.")
     elif n:
@@ -782,7 +782,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:now
 .ttl{position:relative;width:96px;height:6px;background:#efeff3;border-radius:3px;overflow:hidden;margin-bottom:4px}
 .ttl i{position:absolute;left:0;top:0;bottom:0;background:var(--blue);border-radius:3px;transition:width 1s linear}
 .ttl.low i{background:var(--orange)}
-.pb{position:relative;width:120px;height:8px;background:#efeff3;border-radius:4px;margin-bottom:4px}
+.pb{position:relative;width:110px;height:8px;background:#efeff3;border-radius:4px;margin-bottom:4px}
 .pb i{position:absolute;left:0;top:0;bottom:0;background:var(--blue);border-radius:4px}
 .pb b{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--orange);border-radius:1px}
 .strip{display:flex;gap:1px}
@@ -813,6 +813,8 @@ details summary{cursor:pointer;color:var(--sub);font-size:12.5px;margin:14px 0 8
 .daychart{display:flex;gap:12px;align-items:flex-end;overflow-x:auto} .day{text-align:center} .bars{display:flex;gap:2px;align-items:flex-end;height:114px}
 .bar{width:12px;border-radius:2px 2px 0 0} .old_5m{background:#c7c7cc} .cc_1h{background:#8fb4f2} .live{background:#2f6fdf}
 .loading{opacity:.55;transition:opacity .2s}
+@media(max-width:1120px){.o1{display:none}}
+@media(max-width:820px){.o2{display:none}.chat .t,.chat .sub{max-width:200px}}
 @media (prefers-reduced-motion: reduce){*{transition:none!important}}
 </style></head><body><div class="wrap">
 <header><h1>Prompt-cache keep-alive</h1>
@@ -865,7 +867,7 @@ function drawChart(box, data, mode) {
   var y = function (v) { return T + ih * (hi - v) / (hi - lo); };
   var bw = iw / n, x = function (i) { return L + bw * (i + 0.5); };
   var g = '';
-  var ticks = [lo, lo / 2, 0, hi / 2, hi].filter(function (v, i, a) { return a.indexOf(v) === i; });
+  var ticks = [0, hi, hi / 2, lo, lo / 2].filter(function (v, i, a) { return a.slice(0, i).every(function (u) { return Math.abs(y(u) - y(v)) > 16; }); });
   ticks.forEach(function (v) { g += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + y(v) + '" y2="' + y(v) + '" stroke="' + (v === 0 ? '#c7c7cc' : '#efeff3') + '"/><text x="' + (L - 8) + '" y="' + (y(v) + 4) + '" text-anchor="end">' + (v < 0 ? '−' : '') + tok(Math.abs(v)) + '</text>'; });
   var every = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(iw / 78))));
   var long = data.bucket >= 86400 || (s[n - 1].t - s[0].t) > 1.5 * 86400;
@@ -940,7 +942,7 @@ function overview() {
       '<div><b>' + keep.length + '</b>keep-alives due in the next hour · ~' + tok(keepCost) + '</div><div><b>' + tok(rows.reduce(function (a, r) { return a + r.at_stake; }, 0)) + '</b>rewrite cost if all went cold</div>' +
       (d.small ? '<div><b>' + d.small + '</b>smaller chats, not kept</div>' : '');
     if (!rows.length) { document.getElementById('live').innerHTML = '<div class="empty">No chat has a warm cache right now.</div>'; }
-    else document.getElementById('live').innerHTML = '<table><tr><th>Chat</th><th class="num">Context</th><th class="num">Idle</th><th>Cache expires</th><th>Chance you return in the hour after the check</th><th title="Next 24 idle hours: green where the policy would keep it">Next 24 h</th><th class="num">This pause</th><th>Next check</th></tr>' + rows.map(liveRow).join('') + '</table>';
+    else document.getElementById('live').innerHTML = '<table><tr><th>Chat</th><th class="num">Context</th><th class="num o2">Idle</th><th>Cache expires</th><th title="The chance, from your history, that you come back within the hour after the next check; the red mark is the chance needed for a keep-alive to pay">Chance you return</th><th class="o1" title="The next 24 idle hours: green where the policy would keep it alive">Next 24 h</th><th class="num o1">This pause</th><th>Next check</th></tr>' + rows.map(liveRow).join('') + '</table>';
     var ex = d.expired;
     document.getElementById('expired').innerHTML = ex.length ? '<details><summary>Expired in the last 6 hours (' + ex.length + ')</summary><div class="card flush"><table><tr><th>Chat</th><th class="num">Context</th><th>Expired</th><th class="num">Keep-alives</th><th>Why</th></tr>' + ex.map(function (r) {
       return '<tr><td class="chat">' + chatCell(r) + '</td><td class="num">' + tok(r.prompt) + '</td><td>' + when(r.expires) + '</td><td class="num">' + (r.pings ? r.pings + ' · ' + tok(r.cost) : '–') + '</td><td class="sub">' + esc(r.note || (r.verdict === 'expire' ? 'chance of return below break-even' : '')) + '</td></tr>';
@@ -951,12 +953,12 @@ function overview() {
     var p = r.p, need = r.need, sc = Math.max(0.3, p || 0, need || 0) * 1.1;
     var pb = p == null ? '<span class="sub">fixed rule</span>' : '<div class="pb"><i style="width:' + (100 * Math.min(p, sc) / sc).toFixed(0) + '%"></i><b style="left:' + (100 * Math.min(need, sc) / sc).toFixed(0) + '%"></b></div><div class="sub"><b style="color:var(--ink)">' + pct(p) + '</b> at ' + r.idle_h_next + ' h idle · needs ' + pct(need) + '</div>';
     var strip = '';
-    if (r.strip) { var cur = Math.max(1, Math.min(24, Math.round(r.idle_h_next))); strip = '<div class="strip">' + r.strip.map(function (k, j) { return '<i class="' + (k ? 'k' : '') + (j + 1 === cur ? ' now' : '') + '" title="' + (j + 1) + ' h idle: ' + (k ? 'keep' : 'let expire') + '"></i>'; }).join('') + '</div><div class="sub" style="white-space:nowrap">' + (r.verdict === 'keep' ? 'warm ~' + r.keep_hours + ' h more if you stay away' : '&nbsp;') + '</div>'; }
+    if (r.strip) { var cur = Math.max(1, Math.min(24, Math.round(r.idle_h_next))); strip = '<div class="strip">' + r.strip.map(function (k, j) { return '<i class="' + (k ? 'k' : '') + (j + 1 === cur ? ' now' : '') + '" title="' + (j + 1) + ' h idle: ' + (k ? 'keep' : 'let expire') + '"></i>'; }).join('') + '</div><div class="sub" style="white-space:nowrap">' + (r.verdict === 'keep' ? 'keeps ~' + r.keep_hours + ' h more' : '&nbsp;') + '</div>'; }
     var v = {keep: ['p-keep', 'Keeps it'], expire: ['p-expire', 'Lets it expire'], letgo: ['p-letgo', 'Let go'], small: ['p-small', 'Too small'], untracked: ['p-untracked', 'Not tracked'], off: ['p-off', 'Off']}[r.verdict];
     var check = (r.verdict === 'keep' || r.verdict === 'expire') ? '<span class="pill ' + v[0] + '">' + v[1] + '</span><div class="sub" style="white-space:nowrap">' + clock(r.next_check) + ' · in <span data-until="' + r.next_check + '"></span></div>' : '<span class="pill ' + v[0] + '" title="' + esc(r.note) + '">' + v[1] + '</span><div class="sub" style="max-width:200px;white-space:normal">' + esc(r.note) + '</div>';
-    return '<tr><td class="chat">' + chatCell(r) + '</td><td class="num">' + tok(r.prompt) + '</td><td class="num">' + (r.in_use ? '<span class="pill p-use">in use</span>' : '<span data-since="' + r.start + '"></span>') + '</td>' +
-      '<td><div class="ttl" data-ttl="' + r.expires + '"><i></i></div><div class="sub">in <span data-until="' + r.expires + '"></span></div></td><td>' + pb + '</td><td>' + strip + '</td>' +
-      '<td class="num">' + (r.pings ? r.pings + ' kept · ' + tok(r.cost) : '<span class="sub">–</span>') + '</td><td>' + check + '</td></tr>';
+    return '<tr><td class="chat">' + chatCell(r) + '</td><td class="num">' + tok(r.prompt) + '</td><td class="num o2">' + (r.in_use ? '<span class="pill p-use">in use</span>' : '<span data-since="' + r.start + '"></span>') + '</td>' +
+      '<td><div class="ttl" data-ttl="' + r.expires + '"><i></i></div><div class="sub">in <span data-until="' + r.expires + '"></span></div></td><td>' + pb + '</td><td class="o1">' + strip + '</td>' +
+      '<td class="num o1">' + (r.pings ? r.pings + ' kept · ' + tok(r.cost) : '<span class="sub">–</span>') + '</td><td>' + check + '</td></tr>';
   }
   function tick() {
     var now = Date.now() / 1000;
@@ -1021,7 +1023,7 @@ function decisions() {
       var ret = e.ret == null ? '' : '<span class="ret" style="color:' + (e.warm ? 'var(--green)' : 'var(--orange)') + '" title="' + (e.warm ? 'came back to a warm cache' : 'came back to a cold cache') + '">' + (e.warm ? '↩ warm' : '↩ cold') + '</span>';
       var o = OUT[e.outcome];
       return '<tr class="ep" data-i="' + i + '"><td class="num" style="text-align:left">' + when(e.start) + '</td><td class="chat">' + chatCell(e) + '</td><td class="num">' + tok(e.prompt) + '</td><td class="num">' + (e.gap == null ? '<span class="sub">not back</span>' : dur(e.gap)) + '</td>' +
-        '<td><div class="checks">' + (dots || '<span class="sub">none</span>') + ret + '</div></td><td><span class="pill ' + o[0] + '">' + o[1] + '</span>' + (e.why ? '<div class="sub" style="max-width:220px;white-space:normal">' + esc(e.why) + '</div>' : '') + '</td>' +
+        '<td><div class="checks">' + (dots || '<span class="sub">none</span>') + ret + '</div></td><td><span class="pill ' + o[0] + '">' + o[1] + '</span>' + (e.why ? '<div class="sub" style="max-width:220px;white-space:normal" title="' + esc(e.why) + '">' + esc(e.why.split(':')[0]) + '</div>' : '') + '</td>' +
         '<td class="num ' + (e.net > 0 ? 'pos' : e.net < 0 ? 'neg' : '') + '">' + (e.net ? stok(e.net) : '–') + '</td><td class="num">' + (e.best ? tok(e.best) : '–') + '</td></tr>';
     }).join('') + '</table>' + (data.total_episodes > data.episodes.length ? '<div class="empty">Showing the newest ' + data.episodes.length + ' of ' + data.total_episodes + ' pauses.</div>' : '');
     document.querySelectorAll('tr.ep').forEach(function (tr) { tr.onclick = function () {

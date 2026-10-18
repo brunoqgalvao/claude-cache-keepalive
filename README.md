@@ -95,11 +95,13 @@ I also tried a logistic model with signals from Codex's own session logs. It gai
 
 ## Dashboard
 
-- **What the keep-alives did:** rewrites avoided − keep-alive cost = net saved, in tokens and US$ at API prices, plus the last 24 hours and the returns that still found a cold cache.
-- **Cost under each cache rule:** the same requests replayed under the 5-minute cache and the 1-hour cache without keep-alives, next to what actually happened, per day.
-- **The policy:** the rule in use, why the tuner picked it, and the break-even math.
-- **Your return probabilities:** the full idle-hours × chat-size table with sample counts; green cells are where it keeps chats alive.
-- **Every decision:** each hourly check with the chance you return, the chance needed, and what it did.
+Three pages, recomputed from the local logs (new log lines are read incrementally, so it stays fast on a large usage log):
+
+- **Savings & live** (`/`): net saved, rewrites avoided, keep-alive cost and what was left on the table, for the last 6 hours up to all time, with a cumulative or per-period chart of savings against cost. Below it, every chat whose cache is warm right now: when it expires, the chance you come back in the hour after its next check against the break-even chance, how long the policy would keep it if you stay away, and what it will do at the next check. Refreshes every 30 s.
+- **Decisions** (`/decisions`): every time a chat sat idle for over an hour, graded after the fact. *Paid off*: kept alive and you came back warm. *Wasted*: kept alive and nobody came back warm. *Missed*: you came back cold where keeping it alive until then would have cost less than the rewrite, with the reason it wasn't kept. *Not needed*: let it expire and a keep-alive would not have paid. Each pause shows its net next to the best a policy that knew when you'd come back could have done, and a calibration chart compares the chances the model gave with how often you actually came back.
+- **Policy** (`/policy`): the rule in use, why the tuner picked it, the break-even math, the idle-hours × chat-size return table, and the same requests replayed under the 5-minute and 1-hour cache next to what actually happened.
+
+One conversation can carry several cache contexts (side requests, forks, compacted history); the dashboard follows each one separately, the way the cache and the keep-alive see them. With Codex, chat titles come from `~/.codex` on your machine (opencodex logs a hash of the thread id).
 
 ## What it sends and stores
 
