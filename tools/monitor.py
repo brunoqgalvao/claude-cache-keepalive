@@ -36,6 +36,8 @@ def realized(floor):
                 pings += 1
                 spent += READ.get(e.get('model'), 0.1) * e.get('read', 0) + 2.0 * e.get('write', 0) + e.get('input', 0) + 10
     last = {}; saved = 0.0; rescues = 0; base = 0.0
+    if not USAGE.exists():  # fresh install: nothing to measure yet, keep the default policy running
+        return dict(pings=pings, rescues=0, saved=0, spent=round(spent), net=round(-spent), net_pct=None, since=since)
     with open(USAGE) as f:
         for line in f:
             if '"anthropic' not in line[:400]:
@@ -93,7 +95,7 @@ def main():
     elif flag.exists():
         action = 'still disabled (re-enable with install.py --enable)'
     status = dict(checked_at=time.strftime('%Y-%m-%dT%H:%M:%S'), action=action, reason=reason, realized_72h=r,
-                  policy={k: policy.get(k) for k in ('max_idle_s', 'min_prompt_tokens', 'daily_cap', 'expected_saving_pct', 'trained_at')},
+                  policy={k: policy.get(k) for k in ('mode', 'max_idle_s', 'min_prompt_tokens', 'daily_cap', 'expected_saving_pct', 'trained_at')},
                   tune_ok=tune.returncode == 0)
     (D / 'status.json').write_text(json.dumps(status, indent=1))
     print(json.dumps(status, indent=1))
