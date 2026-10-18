@@ -9,18 +9,33 @@ Two setups:
 - **opencodex** (Codex with Claude models): a small patch to opencodex. Also switches opencodex from its 5-minute default to the 1-hour cache, which on its own saves tokens.
 - **Claude Code**: a local pass-through proxy. Claude Code's main chat already uses the 1-hour cache on a subscription; this keeps it warm past the hour.
 
+## Install with your agent
+
+Point Codex or Claude Code at this repo and ask it to install. For example:
+
+> Install https://github.com/brunoqgalvao/claude-cache-keepalive for opencodex (or: for Claude Code). Follow its README, then show me the dashboard.
+
+Notes for the agent doing the install:
+
+- opencodex: run `python3 opencodex/install.py --restart-when-quiet` from the repo root. It needs opencodex installed with npm and Claude accounts logged in through OAuth. The flag restarts opencodex once no chat has been active for 10 minutes, so it does not cut off the chat running the install. Then open http://127.0.0.1:8797.
+- Claude Code: run `python3 claude-code/install.py`, then tell the user to restart open Claude Code sessions. Open http://127.0.0.1:8798.
+- Both installers are idempotent; rerun after an opencodex update. Uninstall with `--uninstall`.
+
 ## What it saved me
 
-One user, about 80k Anthropic requests through opencodex, Opus 5.5, Claude subscription. Costs in Anthropic's price ratios (5-min write 1.25x, 1-hour write 2x, read 0.05x).
+![Same Claude chats, three cache policies](docs/savings.png)
 
-| | input cost vs 1-hour cache alone |
-|---|---|
-| opencodex default (5-minute cache) | about +5% to +10% |
-| 1-hour cache only (Claude Code's default) | baseline |
-| 1-hour cache + keep-alive, first 30 hours live | **-10.6%** |
-| 1-hour cache + keep-alive, backtest on 2 weeks | -19% to -23% |
+44 hours live on my opencodex traffic (9,049 requests, Opus 5.5, Claude subscription), with each request replayed under the other two cache rules. Quota counted as input plus output in Anthropic's price ratios (5-min write 1.25x, 1-hour write 2x, read 0.05x, output 5x):
 
-Live, all 369 keep-alives that got a response read the full cached context and wrote nothing, and chats stayed warm after 4 hours idle. After paying for every keep-alive, net savings were 11.4% of input over the period. On a subscription this is quota, not dollars; Anthropic doesn't publish how cache tokens count against limits.
+| | quota used | vs 5-minute default |
+|---|---|---|
+| 5-minute cache (opencodex default) | 407M | |
+| 1-hour cache only (Claude Code's default) | 373M | -8% |
+| 1-hour cache + learned keep-alive | 342M | **-16%**, or 19% more usage from the same plan |
+
+Keep-alives cost 10.5M tokens and avoided 40.8M of rewrites. Every keep-alive that got a response read the full cached context and wrote nothing. On a subscription this is quota, not dollars; Anthropic doesn't publish exactly how cache tokens count against limits.
+
+![Will you come back within the next hour?](docs/model.png)
 
 Details, methods and the things that did not work: [analysis/RESULTS.md](analysis/RESULTS.md).
 
