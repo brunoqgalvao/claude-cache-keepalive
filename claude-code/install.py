@@ -39,7 +39,13 @@ def launchd(name, args, extra, env):
         '</dict></plist>\n')
     uid = os.getuid()
     subprocess.run(['launchctl', 'bootout', f'gui/{uid}/{LABELS[name]}'], capture_output=True)
-    subprocess.run(['launchctl', 'bootstrap', f'gui/{uid}', str(plist)], capture_output=True)
+    for _ in range(5):  # bootstrap right after bootout can fail while the old job is still tearing down
+        time.sleep(0.5)
+        subprocess.run(['launchctl', 'bootstrap', f'gui/{uid}', str(plist)], capture_output=True)
+        if subprocess.run(['launchctl', 'print', f'gui/{uid}/{LABELS[name]}'], capture_output=True).returncode == 0:
+            break
+    else:
+        print(f'warning: could not start {LABELS[name]}; try: launchctl bootstrap gui/{uid} {plist}')
 
 def proxy_up():
     try:
@@ -73,6 +79,43 @@ def edit_settings(add):
             d.pop('env', None)
     SETTINGS.write_text(json.dumps(d, indent=2) + '\n')
 
+def seed_from_transcripts(days=14):
+    """Learn from Claude Code's own transcripts (token counts and timestamps only) so the policy fits you on day one."""
+    import datetime, glob, hashlib
+    out = D / 'usage.jsonl'
+    if out.exists() and out.stat().st_size > 100_000:
+        return 0
+    since = time.time() - days * 86400
+    rows = []
+    for f in glob.glob(str(pathlib.Path.home() / '.claude' / 'projects' / '*' / '*.jsonl')):
+        try:
+            if os.path.getmtime(f) < since:
+                continue
+            for line in open(f, errors='ignore'):
+                if '"usage"' not in line or '"isSidechain":true' in line.replace(' ', ''):
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                m = d.get('message') or {}
+                u = m.get('usage') or {}
+                if 'cache_read_input_tokens' not in u or d.get('isSidechain'):
+                    continue
+                t = datetime.datetime.fromisoformat(d['timestamp'].replace('Z', '+00:00')).timestamp()
+                if t < since:
+                    continue
+                cr, cc, inp = (int(u.get(k) or 0) for k in ('cache_read_input_tokens', 'cache_creation_input_tokens', 'input_tokens'))
+                rows.append({'provider': 'anthropic-claude-code-history', 'timestamp': int(t * 1000), 'status': 200, 'model': m.get('model'),
+                             'conversationId': hashlib.sha256(str(d.get('sessionId')).encode()).hexdigest()[:32],
+                             'usage': {'inputTokens': inp + cr + cc, 'cacheReadInputTokens': cr, 'cacheCreationInputTokens': cc, 'outputTokens': int(u.get('output_tokens') or 0)}})
+        except Exception:
+            continue
+    rows.sort(key=lambda r: r['timestamp'])
+    existing = out.read_text() if out.exists() else ''
+    out.write_text(''.join(json.dumps(r) + '\n' for r in rows) + existing)
+    return len(rows)
+
 def install(a):
     D.mkdir(parents=True, exist_ok=True)
     os.chmod(D, 0o700)
@@ -84,6 +127,10 @@ def install(a):
         (D / 'state.json').write_text(json.dumps({'switched_at': time.time()}))
     py = sys.executable
     env = {'KEEPALIVE_DIR': str(D)}
+    n = seed_from_transcripts()
+    if n:
+        print(f'learned from {n:,} requests in your Claude Code transcripts (last 14 days):')
+        subprocess.run([py, str(D / 'tune.py'), '--days', '14'], env={**os.environ, **env})
     if platform.system() == 'Darwin' and not a.no_launchd:
         launchd('proxy', [py, str(D / 'keepalive_proxy.py')], '<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>', env)
         launchd('dashboard', [py, str(D / 'dashboard.py')], '<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>', {**env, 'KEEPALIVE_DASHBOARD_PORT': str(DASH_PORT)})
@@ -103,7 +150,8 @@ def install(a):
     edit_settings(True)
     print(f'Claude Code now goes through http://127.0.0.1:{PORT} with a 1-hour cache')
     print(f'dashboard: http://127.0.0.1:{DASH_PORT}/   logs: {D}')
-    print('policy: keep alive up to 4 h for chats over 40k tokens until there is enough usage to tune (the monitor tunes daily)')
+    if not (D / 'policy.json').exists():
+        print('policy: keep alive up to 4 h for chats over 40k tokens until there is enough usage to tune (the monitor tunes daily)')
     print('restart open Claude Code sessions to pick it up')
 
 def uninstall(a):

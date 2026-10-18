@@ -2,6 +2,8 @@
 """Install the prompt-cache keep-alive into opencodex.
 
   python3 install.py              install (or update) and tune on your usage
+  python3 install.py --restart-when-quiet
+                                  same, then restart opencodex by itself once no chat is running
   python3 install.py --enable     clear a "disabled" flag set by the monitor
   python3 install.py --uninstall  restore opencodex's original adapter and remove the extras
 
@@ -19,7 +21,8 @@ import argparse, json, os, pathlib, platform, re, shutil, subprocess, sys, time
 HERE = pathlib.Path(__file__).resolve().parent
 HOME = pathlib.Path(os.environ.get('OPENCODEX_HOME', pathlib.Path.home() / '.opencodex')).expanduser()
 D = HOME / 'cache-keepalive'
-LABELS = {'dashboard': 'com.claude-cache-keepalive.dashboard', 'monitor': 'com.claude-cache-keepalive.monitor'}
+LABELS = {'dashboard': 'com.claude-cache-keepalive.dashboard', 'monitor': 'com.claude-cache-keepalive.monitor',
+          'quiet-restart': 'com.claude-cache-keepalive.quiet-restart'}
 IMPORT = 'import { keepaliveCapture, keepaliveDone, type KeepaliveCapture } from "../lib/cache-keepalive";'
 TAG = ' // claude-cache-keepalive'
 
@@ -106,7 +109,13 @@ def launchd(name, args, extra):
         '</dict></plist>\n')
     uid = os.getuid()
     subprocess.run(['launchctl', 'bootout', f'gui/{uid}/{LABELS[name]}'], capture_output=True)
-    subprocess.run(['launchctl', 'bootstrap', f'gui/{uid}', str(plist)], capture_output=True)
+    for _ in range(5):  # bootstrap right after bootout can fail while the old job is still tearing down
+        time.sleep(0.5)
+        subprocess.run(['launchctl', 'bootstrap', f'gui/{uid}', str(plist)], capture_output=True)
+        if subprocess.run(['launchctl', 'print', f'gui/{uid}/{LABELS[name]}'], capture_output=True).returncode == 0:
+            break
+    else:
+        print(f'warning: could not start {LABELS[name]}; try: launchctl bootstrap gui/{uid} {plist}')
 
 def install(a):
     src = find_src(a.opencodex_src)
@@ -115,7 +124,7 @@ def install(a):
     os.chmod(D, 0o700)
     shutil.copy(HERE / 'cache-keepalive.ts', src / 'lib' / 'cache-keepalive.ts')
     print('adapter:', patch_adapter(src))
-    for f in ('tune.py', 'monitor.py', 'dashboard.py'):
+    for f in ('tune.py', 'monitor.py', 'dashboard.py', 'quiet_restart.py'):
         shutil.copy(HERE.parent / 'tools' / f, D / f)
     for f in ('install.py', 'cache-keepalive.ts'):
         shutil.copy(HERE / f, D / f)
@@ -133,7 +142,15 @@ def install(a):
     else:
         print(f'add a daily job for the monitor, e.g. crontab: 15 6 * * * {py} {D}/monitor.py')
         print(f'dashboard: {py} {D}/dashboard.py, then open http://127.0.0.1:8797/')
-    print('\nnow restart opencodex so it loads the patch:  ocx restart')
+    if a.restart_when_quiet and platform.system() == 'Darwin' and not a.no_launchd:
+        launchd('quiet-restart', [py, str(D / 'quiet_restart.py')], '<key>RunAtLoad</key><true/>')
+        print('\nopencodex will restart by itself once no chat has been active for 10 minutes')
+        print(f'(one-shot job; progress in {D}/quiet_restart.json)')
+    elif a.restart_when_quiet:
+        print(f'\nto restart once nothing is running:  nohup {py} {D}/quiet_restart.py &')
+    else:
+        print('\nnow restart opencodex so it loads the patch:  ocx restart')
+        print('  (or rerun with --restart-when-quiet to let it restart once no chat is running)')
     print('after an opencodex update, run this installer again (updates replace the patched file)')
 
 def uninstall(a):
@@ -176,6 +193,8 @@ def main():
     ap.add_argument('--enable', action='store_true', help='clear the "disabled" flag set by the monitor')
     ap.add_argument('--keep-1h', action='store_true', help='with --uninstall: keep the 1-hour cache setting')
     ap.add_argument('--no-launchd', action='store_true', help='skip the macOS background jobs')
+    ap.add_argument('--restart-when-quiet', action='store_true',
+                    help='restart opencodex automatically once no chat has been active for 10 minutes')
     ap.add_argument('--opencodex-src', help='path to opencodex/src if it is not under "npm root -g"')
     a = ap.parse_args()
     if a.enable:

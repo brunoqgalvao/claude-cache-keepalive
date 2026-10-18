@@ -18,11 +18,19 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import { getConfigDir } from "../config/paths";
 import { loadAuthStore } from "../oauth/store";
 
+type Hazard = { size_edges: number[]; step_s: number; p: number[][] };
+
 type Policy = {
+  mode: "hazard" | "rule";
   max_idle_s: number;
   min_prompt_tokens: number;
   daily_cap: number;
+  shared_floor_tokens: number;
+  hazard?: Hazard;
 };
+
+const READ_MULT: Record<string, number> = { "claude-opus-5-5": 0.05, "claude-sonnet-5-5": 0.05, "claude-fable-5-1": 0.025 };
+const readMult = (model: string) => READ_MULT[model] ?? 0.1;
 
 type Conv = {
   key: string;
@@ -52,7 +60,7 @@ export type KeepaliveCapture = {
   done?: boolean;
 };
 
-const DEFAULT_POLICY: Policy = { max_idle_s: 4 * 3600, min_prompt_tokens: 40_000, daily_cap: 400 };
+const DEFAULT_POLICY: Policy = { mode: "rule", max_idle_s: 4 * 3600, min_prompt_tokens: 40_000, daily_cap: 400, shared_floor_tokens: 30_000 };
 const MAX_CONVS = 300;
 const LEAD_S = 60;
 const TTL_S = 3600;
@@ -82,10 +90,16 @@ function policy(): Policy {
     const mtime = statSync(path).mtimeMs;
     if (policyCache?.mtime === mtime) return policyCache.policy;
     const p = JSON.parse(readFileSync(path, "utf8")) as Partial<Policy>;
+    const num = (v: unknown, d: number) => (typeof v === "number" && Number.isFinite(v) ? v : d);
+    const hz = p.hazard;
+    const hazardOk = !!hz && Array.isArray(hz.size_edges) && Array.isArray(hz.p) && hz.p.length === hz.size_edges.length;
     const merged: Policy = {
-      max_idle_s: Number.isFinite(p.max_idle_s) ? Number(p.max_idle_s) : DEFAULT_POLICY.max_idle_s,
-      min_prompt_tokens: Number.isFinite(p.min_prompt_tokens) ? Number(p.min_prompt_tokens) : DEFAULT_POLICY.min_prompt_tokens,
-      daily_cap: Number.isFinite(p.daily_cap) ? Number(p.daily_cap) : DEFAULT_POLICY.daily_cap,
+      mode: p.mode === "hazard" && hazardOk ? "hazard" : "rule",
+      max_idle_s: num(p.max_idle_s, DEFAULT_POLICY.max_idle_s),
+      min_prompt_tokens: num(p.min_prompt_tokens, DEFAULT_POLICY.min_prompt_tokens),
+      daily_cap: num(p.daily_cap, DEFAULT_POLICY.daily_cap),
+      shared_floor_tokens: num(p.shared_floor_tokens, DEFAULT_POLICY.shared_floor_tokens),
+      hazard: hazardOk ? hz : undefined,
     };
     policyCache = { mtime, policy: merged };
     return merged;
@@ -93,6 +107,29 @@ function policy(): Policy {
     return DEFAULT_POLICY;
   }
 }
+
+/** Chance of a return within the next hour (from your history) vs the chance needed for a re-read to pay. */
+function decide(c: Conv, p: Policy, idleS: number): { ok: boolean; reason: string; p_return?: number; p_needed?: number } {
+  const r = readMult(c.model);
+  const reuse = Math.max(0, 0.97 * (c.prompt + c.out) - p.shared_floor_tokens);
+  const cost = r * (c.prompt + c.out) + 2 * 30 + 5 * 5;
+  const needed = reuse > 0 ? cost / ((2 - r) * reuse) : 1;
+  if (p.mode !== "hazard" || !p.hazard) {
+    const ok = idleS + TTL_S <= p.max_idle_s + 60 && c.prompt >= p.min_prompt_tokens;
+    return { ok, reason: ok ? "rule" : "max_idle", p_needed: round4(needed) };
+  }
+  const hz = p.hazard;
+  let b = -1;
+  for (let i = 0; i < hz.size_edges.length; i++) if (c.prompt >= hz.size_edges[i]!) b = i;
+  if (b < 0) return { ok: false, reason: "too_small", p_needed: round4(needed) };
+  const row = hz.p[b]!;
+  const k = Math.max(1, Math.min(row.length, Math.round(idleS / hz.step_s)));
+  const pr = row[k - 1] ?? 0;
+  const ok = pr > needed && idleS + TTL_S <= p.max_idle_s + 60;
+  return { ok, reason: ok ? "worth_it" : (pr > needed ? "max_idle" : "not_worth_it"), p_return: round4(pr), p_needed: round4(needed) };
+}
+
+function round4(x: number): number { return Math.round(x * 1e4) / 1e4; }
 
 function underDailyCap(p: Policy): boolean {
   const day = new Date().toISOString().slice(0, 10);
@@ -201,17 +238,18 @@ async function fire(key: string): Promise<void> {
   c.timer = undefined;
   const p = policy();
   const idleS = (Date.now() - c.lastDoneAt) / 1000;
-  const base = { conv: key, model: c.model, prompt: c.prompt, idle_s: Math.round(idleS), pings_before: c.pings };
+  const verdict = decide(c, p, idleS);
+  const base = { v: 2, mode: p.mode, conv: key, model: c.model, prompt: c.prompt, idle_s: Math.round(idleS), pings_before: c.pings, p_return: verdict.p_return, p_needed: verdict.p_needed };
   const stop = (reason: string) => { log({ event: "stop", reason, ...base }); convs.delete(key); };
   if (disabled()) return stop("disabled");
-  if (idleS + TTL_S > p.max_idle_s + 60) return stop("max_idle");
+  if (!verdict.ok) return stop(verdict.reason);
   if (!underDailyCap(p)) return stop("daily_cap");
   const token = currentToken(c);
   if (!token || !c.bodyGz) return stop("no_valid_token");
   const started = Date.now();
   const result = await ping(c, token);
   today.pings++;
-  log({ event: "ping", ms: Date.now() - started, ...base, ...result });
+  log({ event: "ping", reason: verdict.reason, ms: Date.now() - started, ...base, ...result });
   if (result.status !== 200 || typeof result.read !== "number") return void convs.delete(key);
   // If the conversation's opening changed upstream, the old prefix no longer matches what is sent.
   if ((result.read as number) < 0.5 * c.prompt) return stop("cache_changed");

@@ -4,8 +4,9 @@
 Realized saving = for every return after more than 1 h idle that found its cache warm, the full
 rewrite it avoided (2x minus the read price, above the always-cached system prompt), minus the
 cost of every keep-alive sent. If keep-alives lost tokens over the last 72 h (with at least 20
-sent), or the tuner says they would not pay on your recent usage, this writes the file
-"disabled" and the proxy stops sending them. Re-enable with: python3 install.py --enable
+sent), this writes the file "disabled" and they stop until you run install.py --enable. If the
+tuner finds they would not pay on your recent usage, they stop too, and come back on by themselves
+when a later retune finds they pay again.
 """
 import json, os, pathlib, subprocess, sys, time
 
@@ -69,15 +70,27 @@ def main():
         pass
     r = realized(policy.get('shared_floor_tokens', 30_000))
     action = 'ok'
-    reason = None
+    reason = None; kind = None
     if r['pings'] >= 20 and r['net'] < 0:
+        kind = 'lost'
         reason = f"keep-alives lost {-r['net']:,} token-equivalents over the last 72 h ({r['pings']} sent, {r['rescues']} returns rescued)"
     elif policy.get('max_idle_s') == 0:
+        kind = 'tuner_off'
         reason = 'the tuner found keep-alives would not pay on your last 14 days'
+    flag = D / 'disabled'
+    prev = {}
+    if flag.exists():
+        try:
+            prev = json.loads(flag.read_text())
+        except Exception:
+            prev = {}
     if reason:
         action = 'disabled'
-        (D / 'disabled').write_text(json.dumps({'by': 'monitor', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'reason': reason}) + '\n')
-    elif (D / 'disabled').exists():
+        flag.write_text(json.dumps({'by': 'monitor', 'kind': kind, 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'reason': reason}) + '\n')
+    elif flag.exists() and prev.get('by') == 'monitor' and prev.get('kind') == 'tuner_off':
+        flag.rename(D / f'disabled.cleared-{int(time.time())}')
+        action = 're-enabled: the tuner now finds keep-alives pay on your recent usage'
+    elif flag.exists():
         action = 'still disabled (re-enable with install.py --enable)'
     status = dict(checked_at=time.strftime('%Y-%m-%dT%H:%M:%S'), action=action, reason=reason, realized_72h=r,
                   policy={k: policy.get(k) for k in ('max_idle_s', 'min_prompt_tokens', 'daily_cap', 'expected_saving_pct', 'trained_at')},

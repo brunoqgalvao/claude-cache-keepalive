@@ -35,6 +35,8 @@ python3 opencodex/install.py
 ocx restart
 ```
 
+If chats are running, use `python3 opencodex/install.py --restart-when-quiet` instead of `ocx restart`: a one-shot background job waits until no chat has been active for 10 minutes, asks opencodex for its graceful restart, then removes itself.
+
 The installer:
 
 1. sets `cacheRetention` to `"long"` (1-hour cache) in `~/.opencodex/config.json`
@@ -55,15 +57,30 @@ Then restart open Claude Code sessions. The installer starts the proxy on 127.0.
 - `ANTHROPIC_BASE_URL=http://127.0.0.1:8796`: Claude Code's requests go through the proxy, which relays them to api.anthropic.com unchanged and streams responses back.
 - `CLAUDE_CODE_PROMPT_CACHE_TTL=1h`: 1-hour cache for the main chat. Claude Code does this by default on a subscription, but in my tests it wrote 5-minute caches behind a custom base URL. Keep-alives only apply to 1-hour caches. Subagents keep their 5-minute default.
 
-The dashboard is at http://127.0.0.1:8798. Until there are 200 requests to learn from, it keeps chats over 40k tokens alive for up to 4 hours. If the proxy is not running, Claude Code cannot reach Anthropic, so uninstall it before removing the files.
+The installer seeds the usage log from your existing Claude Code transcripts (`~/.claude/projects`, last 14 days), so the policy is trained on your history from the first minute. If that history says keep-alives would not pay (short sessions, few long pauses), they start switched off: the proxy still relays everything with the 1-hour cache, and keep-alives switch on by themselves once a daily retune says they pay. With fewer than 200 requests to learn from, it keeps chats over 40k tokens alive for up to 4 hours.
+
+The dashboard is at http://127.0.0.1:8798. If the proxy is not running, Claude Code cannot reach Anthropic, so uninstall it before removing the files.
 
 ## How it learns and when it turns off
 
-`tools/tune.py` replays your recent conversations: for every pause longer than an hour it adds up what keep-alives would have cost and what rewrite they would have avoided, for "keep alive up to 0, 1, 2 ... 24 hours" times "only chats over 20k, 40k, 80k, 150k tokens". It keeps the best on your data. It is meant to fit you; it reruns every day.
+`tools/tune.py` replays your recent conversations and fits two policies, then keeps whichever saves more on your data:
 
-`tools/monitor.py` runs daily: it retunes, then measures what keep-alives actually did over the last 72 hours (rewrites avoided on returns after more than 1 hour idle, minus the cost of every keep-alive). If they lost tokens, or the tuner finds they would not pay, it writes a `disabled` file and keep-alives stop. Turn them back on with `install.py --enable`.
+- **Probability rule.** For each hour a chat has been idle (1 to 24) and each chat size (20k, 80k, 200k, 500k+ tokens), it counts how often you came back within the next hour. Sparse cells are shrunk toward the overall rate. A keep-alive is sent when that chance beats break-even: keep-alive cost ÷ rewrite avoided, which is about 2.8% for a big Opus chat and 6% for a 20–80k one.
+- **Fixed limit.** "Keep alive up to N hours, only chats over X tokens", the best N and X on your data.
 
-I also tried a logistic model that predicts whether you'll return within the hour, including signals from Codex's own session logs. It gained under one point over the simple "up to N hours" rule: a keep-alive costs about 2.5% of a rewrite on a big chat, so it pays whenever there's more than a few percent chance you come back.
+On my opencodex usage the probability rule wins (12.3% of input saved vs 12.0% for the best fixed limit): return chances are 6–37% in the first three idle hours and mostly 1–5% after that, with spikes like the next morning that a fixed limit can't follow. It reruns every day.
+
+`tools/monitor.py` runs daily: it retunes, then measures what keep-alives actually did over the last 72 hours (rewrites avoided on returns after more than 1 hour idle, minus the cost of every keep-alive). If they lost tokens it writes a `disabled` file and keep-alives stop until you run `install.py --enable`. If only the tuner says they would not pay, they stop and come back on by themselves when a later retune says they pay.
+
+I also tried a logistic model with signals from Codex's own session logs. It gained under one point over the simpler rules: a keep-alive costs about 2.5% of a rewrite on a big chat, so it pays whenever there's more than a few percent chance you come back, and the hour-by-size table already captures most of that.
+
+## Dashboard
+
+- **What the keep-alives did:** rewrites avoided − keep-alive cost = net saved, in tokens and US$ at API prices, plus the last 24 hours and the returns that still found a cold cache.
+- **Cost under each cache rule:** the same requests replayed under the 5-minute cache and the 1-hour cache without keep-alives, next to what actually happened, per day.
+- **The policy:** the rule in use, why the tuner picked it, and the break-even math.
+- **Your return probabilities:** the full idle-hours × chat-size table with sample counts; green cells are where it keeps chats alive.
+- **Every decision:** each hourly check with the chance you return, the chance needed, and what it did.
 
 ## What it sends and stores
 

@@ -16,7 +16,8 @@ import gzip, hashlib, http.client, http.server, json, os, pathlib, ssl, threadin
 D = pathlib.Path(os.environ.get('KEEPALIVE_DIR', pathlib.Path.home() / '.claude-cache-keepalive')).expanduser()
 UPSTREAM = os.environ.get('KEEPALIVE_UPSTREAM', 'api.anthropic.com')
 PORT = int(os.environ.get('KEEPALIVE_PROXY_PORT', '8796'))
-DEFAULT_POLICY = {'max_idle_s': 4 * 3600, 'min_prompt_tokens': 40000, 'daily_cap': 400}
+DEFAULT_POLICY = {'mode': 'rule', 'max_idle_s': 4 * 3600, 'min_prompt_tokens': 40000, 'daily_cap': 400, 'shared_floor_tokens': 30000, 'hazard': None}
+READ = {'claude-opus-5-5': 0.05, 'claude-sonnet-5-5': 0.05, 'claude-fable-5-1': 0.025}
 LEAD_S = int(os.environ.get('KEEPALIVE_LEAD_S', '60'))
 TTL_S = int(os.environ.get('KEEPALIVE_TTL_S', '3600'))  # override only for testing
 HOP = {'host', 'content-length', 'connection', 'accept-encoding', 'transfer-encoding', 'keep-alive', 'proxy-connection', 'upgrade', 'te'}
@@ -40,6 +41,28 @@ def policy():
         return {k: p.get(k, v) for k, v in DEFAULT_POLICY.items()}
     except Exception:
         return dict(DEFAULT_POLICY)
+
+def decide(c, p, idle):
+    """Chance you come back within the next hour (from your history) vs the chance needed for a re-read to pay."""
+    r = READ.get(c['model'], 0.1)
+    reuse = max(0.0, 0.97 * (c['prompt'] + c.get('out', 0)) - p['shared_floor_tokens'])
+    cost = r * (c['prompt'] + c.get('out', 0)) + 2 * 30 + 5 * 5
+    need = cost / ((2 - r) * reuse) if reuse > 0 else 1.0
+    hz = p.get('hazard')
+    if p.get('mode') != 'hazard' or not hz:
+        ok = idle + TTL_S <= p['max_idle_s'] + 60 and c['prompt'] >= p['min_prompt_tokens']
+        return ok, ('rule' if ok else 'max_idle'), None, round(need, 4)
+    b = -1
+    for i, e in enumerate(hz['size_edges']):
+        if c['prompt'] >= e:
+            b = i
+    if b < 0:
+        return False, 'too_small', None, round(need, 4)
+    row = hz['p'][b]
+    k = max(1, min(len(row), round(idle / hz['step_s'])))
+    pr = row[k - 1]
+    ok = pr > need and idle + TTL_S <= p['max_idle_s'] + 60
+    return ok, ('worth_it' if ok else ('max_idle' if pr > need else 'not_worth_it')), round(pr, 4), round(need, 4)
 
 def disabled():
     return os.environ.get('CLAUDE_CACHE_KEEPALIVE') == '0' or (D / 'disabled').exists()
@@ -149,7 +172,7 @@ def done(key, body, headers, sent_at, watch, path):
         with lock:
             convs.pop(key, None)
         return
-    c = {'key': key, 'path': path, 'body': gzip.compress(json.dumps(body).encode()), 'headers': headers, 'model': body.get('model'),
+    c = {'key': key, 'path': path, 'out': out, 'body': gzip.compress(json.dumps(body).encode()), 'headers': headers, 'model': body.get('model'),
          'prompt': prompt, 'sent': sent_at, 'done': time.time(), 'pings': 0}
     with lock:
         convs[key] = c
@@ -169,15 +192,17 @@ def fire(key):
         return
     p = policy()
     idle = time.time() - c['done']
-    base = {'ts': int(time.time() * 1000), 'conv': key, 'model': c['model'], 'prompt': c['prompt'], 'idle_s': int(idle), 'pings_before': c['pings']}
+    ok, why, pr, need = decide(c, p, idle)
+    base = {'ts': int(time.time() * 1000), 'v': 2, 'src': 'claude-code', 'mode': p.get('mode'), 'conv': key, 'model': c['model'], 'prompt': c['prompt'],
+            'idle_s': int(idle), 'pings_before': c['pings'], 'p_return': pr, 'p_needed': need}
     def stop(reason):
         jlog('keepalive.jsonl', {'event': 'stop', 'reason': reason, **base})
         with lock:
             convs.pop(key, None)
     if disabled():
         return stop('disabled')
-    if idle + TTL_S > p['max_idle_s'] + 60:
-        return stop('max_idle')
+    if not ok:
+        return stop(why)
     day = time.strftime('%Y-%m-%d')
     if today['day'] != day:
         today.update(day=day, pings=0)
@@ -186,7 +211,7 @@ def fire(key):
     started = time.time()
     r = ping(c)
     today['pings'] += 1
-    jlog('keepalive.jsonl', {'event': 'ping', 'ms': int((time.time() - started) * 1000), **base, **r})
+    jlog('keepalive.jsonl', {'event': 'ping', 'reason': why, 'ms': int((time.time() - started) * 1000), **base, **r})
     if r.get('status') != 200 or 'read' not in r:
         with lock:
             convs.pop(key, None)

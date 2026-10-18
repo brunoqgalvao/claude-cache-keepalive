@@ -18,6 +18,8 @@ READ = {'claude-opus-5-5': 0.05, 'claude-sonnet-5-5': 0.05, 'claude-fable-5-1': 
 W60, TTL, STEP = 2.0, 3600, 3540
 IDLE_GRID_H = [0, 1, 2, 3, 4, 6, 8, 12, 24]
 SIZE_GRID = [20_000, 40_000, 80_000, 150_000]
+SIZE_EDGES = [20_000, 80_000, 200_000, 500_000]   # hazard buckets: 20-80k, 80-200k, 200-500k, 500k+
+MAX_K = 24                                       # checkpoints: about every hour, up to 24 h idle
 
 def rmult(model): return READ.get(model, 0.1)
 
@@ -81,6 +83,73 @@ def evaluate(streams, idle_h, min_size, floor, end):
                 spent += n_allowed * ping_cost(x); pings += n_allowed
     return saved - spent, pings, rescues
 
+def bucket(P):
+    b = -1
+    for i, e in enumerate(SIZE_EDGES):
+        if P >= e:
+            b = i
+    return b
+
+def fit_hazard(streams, end):
+    """P(you come back within the next hour | idle about k hours, chat size), from your history.
+    At checkpoint k (idle k*STEP s) the chat is at risk if you have not come back yet; it is an event
+    if you come back before the refreshed cache would expire (k*STEP + 1 h). Shrunk toward the
+    all-sizes rate for small samples."""
+    nb = len(SIZE_EDGES)
+    ev = [[0] * MAX_K for _ in range(nb)]; risk = [[0] * MAX_K for _ in range(nb)]
+    for v in streams.values():
+        for i, x in enumerate(v):
+            b = bucket(x['P'])
+            if b < 0:
+                continue
+            nxt = v[i + 1] if i + 1 < len(v) else None
+            g = nxt['t'] - x['t'] if nxt else None
+            for k in range(1, MAX_K + 1):
+                t = k * STEP
+                if g is not None and g <= t:
+                    break
+                if g is None and end - x['t'] < t + TTL:
+                    break            # outcome not known yet
+                risk[b][k - 1] += 1
+                if g is not None and g <= t + TTL:
+                    ev[b][k - 1] += 1
+    pooled = [(sum(ev[b][k] for b in range(nb)) + 1) / (sum(risk[b][k] for b in range(nb)) + 2) for k in range(MAX_K)]
+    a = 8.0
+    p = [[round((ev[b][k] + a * pooled[k]) / (risk[b][k] + a), 4) for k in range(MAX_K)] for b in range(nb)]
+    return {'size_edges': SIZE_EDGES, 'step_s': STEP, 'p': p, 'at_risk': risk, 'returns': ev}
+
+def needed(x, floor):
+    reuse = max(0.0, 0.97 * (x['P'] + x['out']) - floor)
+    return ping_cost(x) / ((W60 - rmult(x['model'])) * reuse) if reuse > 0 else 1.0
+
+def evaluate_hazard(streams, hz, floor, end, max_idle_h=24):
+    saved = spent = 0.0; pings = rescues = 0
+    for v in streams.values():
+        for i, x in enumerate(v):
+            b = bucket(x['P'])
+            if b < 0:
+                continue
+            need = needed(x, floor)
+            nxt = v[i + 1] if i + 1 < len(v) else None
+            g = nxt['t'] - x['t'] if nxt else None
+            if g is not None and g <= TTL + 30:
+                continue
+            n = 0; covered = False
+            for k in range(1, MAX_K + 1):
+                t = k * STEP
+                if (g is not None and t >= g) or (g is None and t > end - x['t']) or t + TTL > max_idle_h * 3600 + 60:
+                    break
+                if hz['p'][b][k - 1] <= need:
+                    break
+                n += 1
+                if g is not None and t + TTL >= g:
+                    covered = True
+                    break
+            spent += n * ping_cost(x); pings += n
+            if covered:
+                saved += (W60 - rmult(x['model'])) * max(0.0, 0.98 * min(x['P'], nxt['P']) - floor); rescues += 1
+    return saved - spent, pings, rescues
+
 def baseline_cost(streams):
     return sum(max(0, r['P'] - r['cr'] - r['cc']) + W60 * r['cc'] + rmult(r['model']) * r['cr'] for v in streams.values() for r in v)
 
@@ -102,29 +171,38 @@ def main():
             net, pings, rescues = evaluate(streams, h, m, floor, end)
             rows.append(dict(max_idle_h=h, min_prompt_tokens=m, net_tokens=net, saving_pct=100 * net / base, pings=pings, rescues=rescues))
     best = max(rows, key=lambda r: r['net_tokens'])
+    hz = fit_hazard(streams, end)
+    hnet, hpings, hres = evaluate_hazard(streams, hz, floor, end)
     span_days = max(1e-6, (end - min(r['t'] for v in streams.values() for r in v)) / 86400)
-    per_day = best['pings'] / span_days
+    use_hazard = hnet >= best['net_tokens'] and hnet > 0
+    chosen_pings = hpings if use_hazard else best['pings']
     policy = {
-        'max_idle_s': int(best['max_idle_h'] * 3600),
-        'min_prompt_tokens': best['min_prompt_tokens'],
-        'daily_cap': max(100, int(math.ceil(per_day * 1.5 / 50) * 50)),
-        'expected_saving_pct': round(best['saving_pct'], 1),
+        'mode': 'hazard' if use_hazard else 'rule',
+        'max_idle_s': 24 * 3600 if use_hazard else int(best['max_idle_h'] * 3600),
+        'min_prompt_tokens': SIZE_EDGES[0] if use_hazard else best['min_prompt_tokens'],
+        'daily_cap': max(100, int(math.ceil(chosen_pings / span_days * 1.5 / 50) * 50)),
+        'expected_saving_pct': round(100 * (hnet if use_hazard else best['net_tokens']) / base, 1),
         'shared_floor_tokens': floor,
+        'hazard': hz,
+        'hazard_result': {'saving_pct': round(100 * hnet / base, 2), 'pings': hpings, 'rescues': hres},
+        'rule_result': {'max_idle_h': best['max_idle_h'], 'min_prompt_tokens': best['min_prompt_tokens'], 'saving_pct': round(best['saving_pct'], 2), 'pings': best['pings'], 'rescues': best['rescues']},
         'trained_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-        'trained_on': {'days': a.days, 'requests': n, 'conversations': len(streams)},
-        'grid_top': sorted(rows, key=lambda r: -r['net_tokens'])[:5],
+        'trained_on': {'days': a.days, 'requests': n, 'conversations': len(streams), 'baseline_input_tokens': round(base)},
+        'grid': rows,
     }
     print(f"learned from {n:,} requests in {len(streams)} conversations (last {a.days:g} days)")
     print(f"{'keep alive up to':>16} {'chats over':>11} {'saving vs 1h-only':>18} {'pings':>7} {'rescued returns':>16}")
     for r in sorted(rows, key=lambda r: -r['net_tokens'])[:8]:
         print(f"{r['max_idle_h']:>14} h {r['min_prompt_tokens'] // 1000:>9}k {r['saving_pct']:>17.1f}% {r['pings']:>7} {r['rescues']:>16}")
-    if best['max_idle_h'] == 0 or best['net_tokens'] <= 0:
+    print(f"probability policy (keep alive while P(return within the hour) beats break-even): {100 * hnet / base:.1f}%, {hpings} pings, {hres} rescued")
+    if max(hnet, best['net_tokens']) <= 0:
         print('keep-alives would not have paid on your usage; policy keeps them off')
         policy['max_idle_s'] = 0
     if not a.dry_run:
         D.mkdir(parents=True, exist_ok=True)
         (D / 'policy.json').write_text(json.dumps(policy, indent=1))
-        print(f"wrote {D / 'policy.json'}: keep alive up to {best['max_idle_h']} h for chats over {best['min_prompt_tokens'] // 1000}k tokens, cap {policy['daily_cap']}/day")
+        what = 'probability policy' if use_hazard else f"keep alive up to {best['max_idle_h']} h for chats over {best['min_prompt_tokens'] // 1000}k tokens"
+        print(f"wrote {D / 'policy.json'}: {what}, cap {policy['daily_cap']}/day")
     return policy
 
 if __name__ == '__main__':
