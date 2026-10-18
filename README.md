@@ -25,15 +25,17 @@ Notes for the agent doing the install:
 
 ![Same Claude chats, three cache policies](docs/savings.png)
 
-44 hours live on my opencodex traffic (9,049 requests, Opus 5.5, Claude subscription), with each request replayed under the other two cache rules. Quota counted as input plus output in Anthropic's price ratios (5-min write 1.25x, 1-hour write 2x, read 0.05x, output 5x):
+Backtest on two weeks of my opencodex traffic (61k requests, Opus 5.5, Claude subscription). Each day is scored by a model trained only on the days before it, the way the daily retrain works live. Quota is input plus output in Anthropic's price ratios (5-min write 1.25x, 1-hour write 2x, read 0.05x, output 5x). Reproduce with `python3 analysis/backtest_walkforward.py --days 21 --test-days 14`.
 
-| | quota used | vs 5-minute default |
-|---|---|---|
-| 5-minute cache (opencodex default) | 407M | |
-| 1-hour cache only (Claude Code's default) | 373M | -8% |
-| 1-hour cache + learned keep-alive | 342M | **-16%**, or 19% more usage from the same plan |
+| | quota used | vs 5-minute default | vs 1-hour cache |
+|---|---|---|---|
+| 5-minute cache (opencodex default) | 3.41B | | |
+| 1-hour cache only (Claude Code's default) | 2.97B | -13% | |
+| 1-hour cache + learned keep-alive | 2.52B | **-26%** (35% more usage) | **-15%** (18% more usage) |
 
-Keep-alives cost 10.5M tokens and avoided 40.8M of rewrites. Every keep-alive that got a response read the full cached context and wrote nothing. On a subscription this is quota, not dollars; Anthropic doesn't publish exactly how cache tokens count against limits.
+Week by week, the 1-hour cache alone went from 27% less than the 5-minute cache to about even (1% more): it costs 0.75x extra on every turn's new tokens and only pays back when a turn is followed by a 5–60 minute pause, so it wins when more than about 2.4% of turns are (mine: 3.4%). The keep-alive saved a steady 15% on top of the 1-hour cache in both weeks. Keep-alives cost 67M tokens and avoided 512M of rewrites.
+
+The replay models each request's cache read from its real size and the time since the previous one; checked against the reads actually logged, it is within 0.6% for 5-minute-era traffic and 0.1% for 1-hour-era traffic. Live since switching (44 h): 16% less than the 5-minute replay, 8% less than the 1-hour replay. On a subscription this is quota, not dollars; Anthropic doesn't publish exactly how cache tokens count against limits.
 
 ![Will you come back within the next hour?](docs/model.png)
 
