@@ -86,7 +86,7 @@ def seed_from_transcripts(days=14):
     if out.exists() and out.stat().st_size > 100_000:
         return 0
     since = time.time() - days * 86400
-    rows = []
+    rows = {}
     for f in glob.glob(str(pathlib.Path.home() / '.claude' / 'projects' / '*' / '*.jsonl')):
         try:
             if os.path.getmtime(f) < since:
@@ -106,12 +106,13 @@ def seed_from_transcripts(days=14):
                 if t < since:
                     continue
                 cr, cc, inp = (int(u.get(k) or 0) for k in ('cache_read_input_tokens', 'cache_creation_input_tokens', 'input_tokens'))
-                rows.append({'provider': 'anthropic-claude-code-history', 'timestamp': int(t * 1000), 'status': 200, 'model': m.get('model'),
+                # one API call can span several transcript lines (one per content block): keep it once
+                rows[m.get('id') or d.get('uuid')] = {'provider': 'anthropic-claude-code-history', 'timestamp': int(t * 1000), 'status': 200, 'model': m.get('model'),
                              'conversationId': hashlib.sha256(str(d.get('sessionId')).encode()).hexdigest()[:32],
-                             'usage': {'inputTokens': inp + cr + cc, 'cacheReadInputTokens': cr, 'cacheCreationInputTokens': cc, 'outputTokens': int(u.get('output_tokens') or 0)}})
+                             'usage': {'inputTokens': inp + cr + cc, 'cacheReadInputTokens': cr, 'cacheCreationInputTokens': cc, 'outputTokens': int(u.get('output_tokens') or 0)}}
         except Exception:
             continue
-    rows.sort(key=lambda r: r['timestamp'])
+    rows = sorted(rows.values(), key=lambda r: r['timestamp'])
     existing = out.read_text() if out.exists() else ''
     out.write_text(''.join(json.dumps(r) + '\n' for r in rows) + existing)
     return len(rows)

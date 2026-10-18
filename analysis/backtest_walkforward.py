@@ -119,6 +119,9 @@ def main():
     print(f"  1 h + keep-alive     {learned/1e6:9.1f}M   {sign(pc(learned, m5))} than 5-min, {sign(pc(learned, h1))} than 1-hour")
     print(f"  more usage from the same quota: {100*(m5/learned-1):.1f}% vs 5-min, {100*(h1/learned-1):.1f}% vs 1-hour")
     for i, w in sorted(weeks.items()):
+        if w['m5'] <= 0 or w['h1'] <= 0:
+            print(f'  week {i+1}: no usage')
+            continue
         l = w['h1'] - w['net']
         print(f"  week {i+1}: 1-hour {sign(pc(w['h1'], w['m5']))} than 5-min; keep-alive {sign(pc(l, w['m5']))} than 5-min, {sign(pc(l, w['h1']))} than 1-hour")
     print(f"keep-alives: {agg['pings']:,} sent, {agg['rescues']:,} rescues, cost {agg['spent']/1e6:.1f}M, avoided {agg['saved']/1e6:.1f}M")
