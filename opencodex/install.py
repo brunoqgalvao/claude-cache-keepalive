@@ -21,7 +21,7 @@ import argparse, json, os, pathlib, platform, re, shutil, subprocess, sys, time
 HERE = pathlib.Path(__file__).resolve().parent
 HOME = pathlib.Path(os.environ.get('OPENCODEX_HOME', pathlib.Path.home() / '.opencodex')).expanduser()
 D = HOME / 'cache-keepalive'
-LABELS = {'dashboard': 'com.claude-cache-keepalive.dashboard', 'monitor': 'com.claude-cache-keepalive.monitor',
+LABELS = {'menubar': 'com.claude-cache-keepalive.menubar', 'dashboard': 'com.claude-cache-keepalive.dashboard', 'monitor': 'com.claude-cache-keepalive.monitor',
           'quiet-restart': 'com.claude-cache-keepalive.quiet-restart'}
 IMPORT = 'import { keepaliveCapture, keepaliveDone, type KeepaliveCapture } from "../lib/cache-keepalive";'
 TAG = ' // claude-cache-keepalive'
@@ -117,6 +117,19 @@ def launchd(name, args, extra):
     else:
         print(f'warning: could not start {LABELS[name]}; try: launchctl bootstrap gui/{uid} {plist}')
 
+def menubar(start):
+    """Menu bar item: shows that keep-alives are on and what they saved today, and opens the dashboard.
+    Built from tools/menubar.swift; needs swiftc (Xcode command line tools)."""
+    swiftc = shutil.which('swiftc')
+    if not swiftc:
+        return 'menu bar item: skipped (no swiftc; xcode-select --install, then rerun)'
+    shutil.copy(HERE.parent / 'tools' / 'menubar.swift', D / 'menubar.swift')
+    r = subprocess.run([swiftc, '-O', str(D / 'menubar.swift'), '-o', str(D / 'CacheKeepaliveBar')], capture_output=True, text=True)
+    if r.returncode:
+        return 'menu bar item: build failed, skipped (' + (r.stderr.strip().splitlines() or ['?'])[-1][:120] + ')'
+    start([str(D / 'CacheKeepaliveBar')], '<key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>')
+    return 'menu bar item: on (bolt with today\'s net savings; click it for details and the dashboard)'
+
 def install(a):
     src = find_src(a.opencodex_src)
     print(set_retention('long'))
@@ -139,6 +152,8 @@ def install(a):
         launchd('monitor', [py, str(D / 'monitor.py')],
                 '<key>StartCalendarInterval</key><dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>')
         print('dashboard: http://127.0.0.1:8797/  (monitor runs daily at 06:15)')
+        if not a.no_menubar:
+            print(menubar(lambda args, extra: launchd('menubar', args, extra)))
     else:
         print(f'add a daily job for the monitor, e.g. crontab: 15 6 * * * {py} {D}/monitor.py')
         print(f'dashboard: {py} {D}/dashboard.py, then open http://127.0.0.1:8797/')
@@ -193,6 +208,7 @@ def main():
     ap.add_argument('--enable', action='store_true', help='clear the "disabled" flag set by the monitor')
     ap.add_argument('--keep-1h', action='store_true', help='with --uninstall: keep the 1-hour cache setting')
     ap.add_argument('--no-launchd', action='store_true', help='skip the macOS background jobs')
+    ap.add_argument('--no-menubar', action='store_true', help='skip the menu bar item')
     ap.add_argument('--restart-when-quiet', action='store_true',
                     help='restart opencodex automatically once no chat has been active for 10 minutes')
     ap.add_argument('--opencodex-src', help='path to opencodex/src if it is not under "npm root -g"')

@@ -632,6 +632,45 @@ def api_decisions(store, rng):
                 happened=sum(c['happened'] * c['n'] for c in calib) / nd if nd else None, episodes=out[:600], total_episodes=len(out))
 
 
+def api_badge(store):
+    """Small summary for the menu bar item: is it on, what it saved, what it is doing right now."""
+    M = store.model()
+    now = time.time()
+    pol = M['pol']
+    ps = store.proc.get()
+    titles = store.titles.get()
+    midnight = datetime.datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    spans = dict(today=max(M['t0'], midnight), d24=max(M['t0'], now - 86400), all=M['t0'])
+    out = {k: collections.Counter() for k in spans}
+    for d in M['events']:
+        if d['kind'] != 'kept':
+            continue
+        for k, t in spans.items():
+            if d['t'] >= t:
+                out[k]['cost'] += d['cost']; out[k]['cost_usd'] += usd(d['cost'], d['model']); out[k]['pings'] += 1
+    last = None
+    for ep in M['episodes']:
+        if ep['ret'] is None or not ep['warm'] or not ep['pings']:
+            continue
+        g = classify(ep, now, pol, ps)
+        if not g or g['outcome'] != 'paid':
+            continue
+        for k, t in spans.items():
+            if ep['ret'] >= t:
+                out[k]['saved'] += g['saved']; out[k]['saved_usd'] += usd(g['saved'], ep['model']); out[k]['rescues'] += 1
+        if last is None or ep['ret'] > last['t']:
+            last = dict(t=ep['ret'], saved=g['saved'], title=titles.get(ep['cid'], {}).get('title'), away=ep['gap'])
+    for c in out.values():
+        c['net'] = c['saved'] - c['cost']; c['net_usd'] = c['saved_usd'] - c['cost_usd']
+    live = api_live(store)
+    due = [c['next_check'] for c in live['chats'] if c['verdict'] == 'keep']
+    pings = [d['t'] for d in M['events'] if d['kind'] == 'kept']
+    return dict(now=now, on=M['disabled'] is None, disabled=(M['disabled'] or {}).get('reason'), mode=live['head']['mode'],
+                kind='Claude Code' if (D / 'keepalive_proxy.py').exists() else 'opencodex', since=M['t0'],
+                **{k: dict(v) for k, v in out.items()}, warm=len(live['chats']), warm_tokens=sum(c['prompt'] for c in live['chats']),
+                next_keepalive=min(due) if due else None, last_keepalive=max(pings) if pings else None, last_save=last)
+
+
 # ---------------------------------------------------------------- policy page (server-rendered)
 
 def baselines(M):
@@ -1060,6 +1099,8 @@ class H(http.server.BaseHTTPRequestHandler):
         try:
             if u.path == '/api/overview':
                 return self.send(json.dumps(api_overview(STORE, rng or '24h')), 'application/json')
+            if u.path == '/api/badge':
+                return self.send(json.dumps(api_badge(STORE)), 'application/json')
             if u.path == '/api/live':
                 return self.send(json.dumps(api_live(STORE)), 'application/json')
             if u.path == '/api/decisions':

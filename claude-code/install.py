@@ -22,7 +22,7 @@ D = pathlib.Path(os.environ.get('KEEPALIVE_DIR', pathlib.Path.home() / '.claude-
 SETTINGS = pathlib.Path.home() / '.claude' / 'settings.json'
 PORT = 8796
 DASH_PORT = 8798
-LABELS = {'proxy': 'com.claude-cache-keepalive.cc-proxy', 'dashboard': 'com.claude-cache-keepalive.cc-dashboard', 'monitor': 'com.claude-cache-keepalive.cc-monitor'}
+LABELS = {'menubar': 'com.claude-cache-keepalive.menubar', 'proxy': 'com.claude-cache-keepalive.cc-proxy', 'dashboard': 'com.claude-cache-keepalive.cc-dashboard', 'monitor': 'com.claude-cache-keepalive.cc-monitor'}
 ENV = {'ANTHROPIC_BASE_URL': f'http://127.0.0.1:{PORT}', 'CLAUDE_CODE_PROMPT_CACHE_TTL': '1h'}
 
 def launchd(name, args, extra, env):
@@ -46,6 +46,19 @@ def launchd(name, args, extra, env):
             break
     else:
         print(f'warning: could not start {LABELS[name]}; try: launchctl bootstrap gui/{uid} {plist}')
+
+def menubar(start):
+    """Menu bar item: shows that keep-alives are on and what they saved today, and opens the dashboard.
+    Built from tools/menubar.swift; needs swiftc (Xcode command line tools)."""
+    swiftc = shutil.which('swiftc')
+    if not swiftc:
+        return 'menu bar item: skipped (no swiftc; xcode-select --install, then rerun)'
+    shutil.copy(HERE.parent / 'tools' / 'menubar.swift', D / 'menubar.swift')
+    r = subprocess.run([swiftc, '-O', str(D / 'menubar.swift'), '-o', str(D / 'CacheKeepaliveBar')], capture_output=True, text=True)
+    if r.returncode:
+        return 'menu bar item: build failed, skipped (' + (r.stderr.strip().splitlines() or ['?'])[-1][:120] + ')'
+    start([str(D / 'CacheKeepaliveBar')], '<key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>')
+    return 'menu bar item: on (bolt with today\'s net savings; click it for details and the dashboard)'
 
 def proxy_up():
     try:
@@ -136,6 +149,8 @@ def install(a):
         launchd('proxy', [py, str(D / 'keepalive_proxy.py')], '<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>', env)
         launchd('dashboard', [py, str(D / 'dashboard.py')], '<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>', {**env, 'KEEPALIVE_DASHBOARD_PORT': str(DASH_PORT)})
         launchd('monitor', [py, str(D / 'monitor.py')], '<key>StartCalendarInterval</key><dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>20</integer></dict>', env)
+        if not a.no_menubar:
+            print(menubar(lambda args, extra: launchd('menubar', args, extra, {})))
         for _ in range(20):
             if proxy_up():
                 break
@@ -171,6 +186,7 @@ def main():
     ap.add_argument('--uninstall', action='store_true')
     ap.add_argument('--enable', action='store_true', help='clear the "disabled" flag set by the monitor')
     ap.add_argument('--no-launchd', action='store_true', help='do not install macOS background jobs (run the proxy yourself)')
+    ap.add_argument('--no-menubar', action='store_true', help='skip the menu bar item')
     a = ap.parse_args()
     if a.enable:
         f = D / 'disabled'

@@ -101,6 +101,8 @@ Three pages, recomputed from the local logs (new log lines are read incrementall
 - **Decisions** (`/decisions`): every time a chat sat idle for over an hour, graded after the fact. *Paid off*: kept alive and you came back warm. *Wasted*: kept alive and nobody came back warm. *Missed*: you came back cold where keeping it alive until then would have cost less than the rewrite, with the reason it wasn't kept. *Not needed*: let it expire and a keep-alive would not have paid. Each pause shows its net next to the best a policy that knew when you'd come back could have done, and a calibration chart compares the chances the model gave with how often you actually came back.
 - **Policy** (`/policy`): the rule in use, why the tuner picked it, the break-even math, the idle-hours × chat-size return table, and the same requests replayed under the 5-minute and 1-hour cache next to what actually happened.
 
+On macOS the installers also add a menu bar item: a bolt with today's net savings, so you can see at a glance that it is on and working. Its menu shows today, the last 24 hours and the total since install, the chats warm right now and when the next keep-alive is due, the last chat a keep-alive saved, and a link to the dashboard. When a return finds its cache warm, the item briefly shows what that saved. It is built from tools/menubar.swift with swiftc (Xcode command line tools); skip it with --no-menubar.
+
 One conversation can carry several cache contexts (side requests, forks, compacted history); the dashboard follows each one separately, the way the cache and the keep-alive see them. With Codex, chat titles come from `~/.codex` on your machine (opencodex logs a hash of the thread id).
 
 ## What it sends and stores
