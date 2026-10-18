@@ -37,6 +37,9 @@ def build(streams, floor):
             g = nxt['t'] - x['t'] if nxt else None
             if b >= 0 and (g is None or g > T.TTL + 30):
                 prior = [q for q in gaps if q > 300]
+                longs = [q for q in gaps if q > T.TTL + 30][-6:]
+                per = statistics.median(longs) if len(longs) >= 3 else None
+                regular = 1.0 if per and statistics.pstdev(longs) / per < 0.2 else 0.0
                 rows = []
                 for k in range(1, T.MAX_K + 1):
                     t = x['t'] + k * T.STEP
@@ -54,11 +57,16 @@ def build(streams, floor):
                                  1.0 if not prior else 0.0, math.log1p(i), math.log1p(x['out'] / 100)],
                         'global': [math.log1p(max(0.0, t - last_any) / 60), math.log1p(n_hour),
                                    1.0 if t - last_any > 3 * 3600 else 0.0],
+                        # schedule: does this chat usually come back in exactly this window?
+                        'sched': [(sum(1 for q in longs if k * T.STEP < q <= k * T.STEP + T.TTL) + 0.0) / (len(longs) + 1),
+                                  regular,
+                                  regular * math.exp(-((k * T.STEP + T.TTL / 2 - per) / (0.25 * per)) ** 2) if per else 0.0,
+                                  regular * (1.0 if per and k * T.STEP < per else 0.0)],
                     }
                     label = 1 if (g is not None and g <= k * T.STEP + T.TTL) else 0
                     known_at = t + T.TTL if g is None or g > k * T.STEP + T.TTL else x['t'] + g
                     rows.append((k, feats, label, known_at))
-                pauses.append(dict(x=x, nxt=nxt, g=g, rows=rows, need=T.needed(x, floor)))
+                pauses.append(dict(x=x, nxt=nxt, g=g, rows=rows, need=T.needed(x, floor), regular=regular, per=per))
             if g is not None:
                 gaps.append(g)
     return pauses
@@ -121,27 +129,45 @@ def main():
         '+ time of day': ['k', 'size', 'hour'],
         '+ this chat\'s past pauses': ['k', 'size', 'chat'],
         '+ activity in all chats': ['k', 'size', 'global'],
-        'all of the above': ['k', 'size', 'hour', 'chat', 'global'],
+        '+ schedule (when this chat usually fires)': ['k', 'size', 'sched'],
+        'all of the above': ['k', 'size', 'hour', 'chat', 'global', 'sched'],
     }
     res = {name: [0.0, 0.0] for name in list(sets) + ['live table (hour x size)', 'perfect hindsight']}
+    res['past pauses, schedule only on regular chats'] = [0.0, 0.0]
+    reg = {name: [0.0, 0.0] for name in ['live table (hour x size)', '+ schedule (when this chat usually fires)', 'perfect hindsight']}
+    nreg = ntest = 0
     base = 0.0
     for d in range(a.test_days):
         t0 = start + d * 86400; t1 = t0 + 86400
         test = [pz for pz in pauses if t0 <= pz['x']['t'] < t1 and pz['rows']]
+        ntest += len(test); nreg += sum(1 for pz in test if pz['regular'])
+        regtest = [pz for pz in test if pz['regular']]
         train_rows = [r for pz in pauses for r in pz['rows'] if r[3] < t0]
         rp = replay(streams, t0, t1, floor); base += rp['h1'] + rp['out']
         for name, groups in sets.items():
             X = matrix(train_rows, groups); y = np.array([r[2] for r in train_rows], float)
             model = fit(X, y)
             prob = [model(matrix(pz['rows'], groups)) for pz in test]
+            if name == "+ this chat's past pauses": prob_chat = prob
+            if name == '+ schedule (when this chat usually fires)': prob_sched = prob
             s, c = simulate(test, prob, floor); res[name][0] += s; res[name][1] += c
+            if name in reg:
+                s2, c2 = simulate(regtest, [p_ for pz, p_ in zip(test, prob) if pz['regular']], floor); reg[name][0] += s2; reg[name][1] += c2
+        mix = [ps if pz['regular'] else pc for pz, pc, ps in zip(test, prob_chat, prob_sched)]
+        s, c = simulate(test, mix, floor); res['past pauses, schedule only on regular chats'][0] += s; res['past pauses, schedule only on regular chats'][1] += c
         train = {k: [r for r in v if r['t'] < t0] for k, v in streams.items()}
         hz = T.fit_hazard({k: v for k, v in train.items() if v}, t0)
         _, s, c, _, _ = keepalive_net(streams, hz, floor, t0, t1, end)
         res['live table (hour x size)'][0] += s; res['live table (hour x size)'][1] += c
+        hzprob = [np.array([hz['p'][T.bucket(pz['x']['P'])][k - 1] for (k, _, _, _) in pz['rows']]) for pz in regtest]
+        s2, c2 = simulate(regtest, hzprob, floor); reg['live table (hour x size)'][0] += s2; reg['live table (hour x size)'][1] += c2
         s, c = oracle(test, floor); res['perfect hindsight'][0] += s; res['perfect hindsight'][1] += c
+        s2, c2 = oracle(regtest, floor); reg['perfect hindsight'][0] += s2; reg['perfect hindsight'][1] += c2
     print(f'walk-forward, last {a.test_days} days; net saving as % of quota under the 1-hour cache')
     for name, (s, c) in res.items():
+        print(f'  {name:36s} {100 * (s - c) / base:5.1f}%   (avoided {s/1e6:6.0f}M, keep-alives {c/1e6:5.0f}M)')
+    print(f'scheduled chats (regular gaps): {nreg} of {ntest} pauses; net saving on those pauses, % of total quota:')
+    for name, (s, c) in reg.items():
         print(f'  {name:36s} {100 * (s - c) / base:5.1f}%   (avoided {s/1e6:6.0f}M, keep-alives {c/1e6:5.0f}M)')
 
 if __name__ == '__main__':
