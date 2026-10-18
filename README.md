@@ -9,6 +9,8 @@ Two setups:
 - **opencodex** (Codex with Claude models): a small patch to opencodex. Also switches opencodex from its 5-minute default to the 1-hour cache, which on its own saves tokens.
 - **Claude Code**: a local pass-through proxy. Claude Code's main chat already uses the 1-hour cache on a subscription; this keeps it warm past the hour.
 
+![Same chat, same 3-hour break: what happened with the 5-minute cache vs what the keep-alive does](docs/terminals.png)
+
 ## Install with your agent
 
 Point Codex or Claude Code at this repo and ask it to install. For example:
