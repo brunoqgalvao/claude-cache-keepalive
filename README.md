@@ -37,7 +37,7 @@ Week by week, the 1-hour cache alone went from 27% less than the 5-minute cache 
 
 The replay models each request's cache read from its real size and the time since the previous one; checked against the reads actually logged, it is within 0.6% for 5-minute-era traffic and 0.1% for 1-hour-era traffic. Live since switching (44 h): 16% less than the 5-minute replay, 8% less than the 1-hour replay. On a subscription this is quota, not dollars; Anthropic doesn't publish exactly how cache tokens count against limits.
 
-![Will you come back within the next hour?](docs/model.png)
+![Every idle hour, the model makes a bet: four real pauses](docs/model.png)
 
 Details, methods and the things that did not work: [analysis/RESULTS.md](analysis/RESULTS.md).
 
