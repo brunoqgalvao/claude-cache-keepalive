@@ -12,6 +12,7 @@ from backtest_walkforward import replay
 
 IDX = sys.argv[1] if len(sys.argv) > 1 else '/tmp/cache-shots/codex_index.json'
 LLM = '/tmp/cache-shots/llm_labels.json'
+LLMF = '/tmp/cache-shots/llm_features.json'
 NH = 512
 ASK = re.compile(r'\?\s*$|\b(approve|aprova|confirm|reply|respond|let me know|waiting for you|enviar|review page|your call|which one)\b', re.I)
 WAIT = re.compile(r'\b(waiting|aguard|in progress|running|queued|will check|check back|monitor|next run|heartbeat)\b', re.I)
@@ -68,7 +69,8 @@ def main():
     ctx = context_map(streams)
     pauses = [pz for pz in pauses if (pz['x']['t'], pz['x']['P']) in ctx and pz['rows']]
     labels = json.load(open(LLM)) if pathlib.Path(LLM).exists() else {}
-    pauses = [pz for pz in pauses if f"{pz['x']['t']}|{pz['x']['P']}" in labels]
+    feats = json.load(open(LLMF)) if pathlib.Path(LLMF).exists() else {}
+    pauses = [pz for pz in pauses if f"{pz['x']['t']}|{pz['x']['P']}" in labels and f"{pz['x']['t']}|{pz['x']['P']}" in feats]
     lg = lambda q: math.log(q / (1 - q))
     for pz in pauses:
         c = ctx[(pz['x']['t'], pz['x']['P'])]
@@ -77,6 +79,7 @@ def main():
         for (k, f, _, _), hk in zip(pz['rows'], pz['llm']):
             f['struct'] = c['struct']; f['text'] = c['text']
             f['llm'] = [lg(hk)] + [lg(min(max(v, 0.001), 0.999)) for v in lab]
+            f['llmfeat'] = feats[f"{pz['x']['t']}|{pz['x']['P']}"]
     test_days = 14; start = end - test_days * 86400
     sets = {
         'timing: idle + size + past pauses': ['k', 'size', 'chat'],
@@ -85,6 +88,8 @@ def main():
         '+ both': ['k', 'size', 'chat', 'struct', 'text'],
         '+ cheap LLM reading the last exchange': ['k', 'size', 'chat', 'llm'],
         '+ cheap LLM + content signals': ['k', 'size', 'chat', 'struct', 'llm'],
+        '+ LLM yes/no features (follow-up, thank-you, ...)': ['k', 'size', 'chat', 'llmfeat'],
+        '+ LLM yes/no features + content signals': ['k', 'size', 'chat', 'struct', 'llmfeat'],
     }
     res = {n: [0.0, 0.0] for n in ['live table (hour x size)'] + list(sets) + ['cheap LLM alone (no training)', 'perfect hindsight']}
     base = 0.0; n_test = 0
