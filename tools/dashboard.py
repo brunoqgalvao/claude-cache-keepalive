@@ -563,10 +563,23 @@ def plan_window(M, name, start, reset, util):
     ev.sort()
     actual = sum(e[1] for e in ev)
     base = sum(e[2] for e in ev)
-    out = dict(name=name, start=start, reset=reset, used=util, actual=actual, base=base, est=None, hit_at=None)
+    out = dict(name=name, start=start, reset=reset, used=util, actual=actual, base=base, est=None, hit_at=None, series=[], samples=[])
     if actual <= 0 or util <= 0:
         return out
     k = util / actual
+    # the line so far: cumulative use in the window, scaled so it ends at the meter's current reading
+    step = 3600 if reset - start > 86400 else 600
+    ca = cb = 0.0
+    i = 0
+    t = start
+    out['series'].append((round(start), 0.0, 0.0))
+    while True:
+        t = min(t + step, now)
+        while i < len(ev) and ev[i][0] <= t:
+            ca += ev[i][1]; cb += ev[i][2]; i += 1
+        out['series'].append((round(t), round(k * ca, 4), round(k * cb, 4)))
+        if t >= now:
+            break
     out['est'] = k * base
     if out['est'] >= 1:
         cum = 0.0
@@ -578,7 +591,65 @@ def plan_window(M, name, start, reset, util):
     return out
 
 
-def plan_usage(M):
+PLAN_LOG = D / 'plan_history.jsonl'
+
+
+def plan_samples(acct, field, reset):
+    """Meter readings recorded for this account during the window that ends at reset."""
+    out = []
+    try:
+        with open(PLAN_LOG) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get('acct') == acct and r.get(field) is not None and abs(_num(r.get(field + '_reset')) - reset) < 120:
+                    out.append((r['t'], r[field] / 100, r.get('est_' + field)))
+    except OSError:
+        pass
+    return sorted({o[0]: o for o in out}.values())   # one per reading, even if two dashboards recorded it
+
+
+def record_plan(store):
+    """Append each new plan meter reading (and the estimate at that moment) to plan_history.jsonl."""
+    last = {}
+    try:
+        with open(PLAN_LOG) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    last[r['acct']] = r['t']
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    while True:
+        try:
+            q = _json(QUOTA)
+            for k, v in (q.get('rows') or {}).items():
+                if not k.startswith('anthropic') or not isinstance(v, dict):
+                    continue
+                acct = (k[-32:] if len(k) > 40 else k)[:6]
+                t = _num(v.get('updatedAt')) / 1000
+                if not t or t - last.get(acct, 0) < 600:
+                    continue
+                rec = dict(t=round(t), acct=acct, week=v.get('weeklyPercent'), week_reset=_num(v.get('weeklyResetAt')) / 1000,
+                           five=v.get('fiveHourPercent'), five_reset=_num(v.get('fiveHourResetAt')) / 1000)
+                plan = plan_usage(store.model(), samples=False) or []
+                for a in plan:
+                    if a['id'] == acct:
+                        for w in a['windows']:
+                            rec['est_' + ('week' if w['name'] == 'This week' else 'five')] = None if w['est'] is None else round(100 * w['est'], 1)
+                with open(PLAN_LOG, 'a') as f:
+                    f.write(json.dumps(rec) + '\n')
+                last[acct] = t
+        except Exception:
+            pass
+        time.sleep(120)
+
+
+def plan_usage(M, samples=True):
     if (D / 'keepalive_proxy.py').exists():
         return None
     q = _json(QUOTA)
@@ -594,8 +665,11 @@ def plan_usage(M):
                 continue
             reset = v[rk] / 1000
             w = plan_window(M, name, reset - span, reset, v[pk] / 100)
+            if samples:
+                w['samples'] = plan_samples(acct['id'], 'week' if pk == 'weeklyPercent' else 'five', reset)
             if not acct['estimated']:
                 w['est'] = w['hit_at'] = None
+                w['series'] = [(t, a, None) for t, a, _ in w['series']]
             acct['windows'].append(w)
         if acct['windows']:
             out.append(acct)
@@ -880,7 +954,10 @@ p.sub{margin:0 0 10px;max-width:900px}
 .seg button{font:500 12px -apple-system,system-ui;border:0;background:transparent;color:var(--sub);padding:5px 11px;border-radius:6px;cursor:pointer;transition:transform .1s cubic-bezier(.23,1,.32,1)}
 .seg button:active{transform:scale(.97)}
 .seg button.on{background:#fff;color:var(--ink);box-shadow:0 1px 2px rgba(0,0,0,.08)}
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
+.kpis{display:grid;grid-template-columns:minmax(300px,1.55fr) repeat(3,minmax(0,1fr));gap:12px}
+@media(max-width:900px){.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}.kpis .hero{grid-column:1/-1}}
+.kpi.hero{padding:18px 20px}.kpi.hero .big{font-size:52px;letter-spacing:-.03em;margin:6px 0 6px;line-height:1}
+.kpi.small .big{font-size:21px;letter-spacing:-.01em;margin:6px 0 4px}.kpi.small .sub{font-size:11.5px}
 .card{background:var(--card);border-radius:14px;padding:14px 16px;box-shadow:var(--ring)}
 .card.flush{padding:0;overflow:hidden}
 .kpi .lbl,.card .lbl{font-weight:600;font-size:12.5px;color:#3a3a3c}
@@ -950,7 +1027,7 @@ details summary{cursor:pointer;color:var(--sub);font-size:12.5px;margin:14px 0 8
 .bar{width:12px;border-radius:2px 2px 0 0} .old_5m{background:#c7c7cc} .cc_1h{background:#8fb4f2} .live{background:#2f6fdf}
 .loading{opacity:.55;transition:opacity .2s}
 .plancard{margin-top:12px;padding:14px 16px 10px}
-.plan-row{display:grid;grid-template-columns:120px 1fr 120px;gap:16px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
+.plan-row-unused{display:grid;grid-template-columns:120px 1fr 120px;gap:16px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
 .plan-row:first-of-type{border-top:0}
 .plan-name{font-size:12.5px;font-weight:560}
 .plan-bar{position:relative;height:10px;background:#efeff3;border-radius:5px;overflow:hidden;margin-bottom:5px}
@@ -1060,27 +1137,69 @@ function drawChart(box, data, mode) {
 /* ---------- overview ---------- */
 function useCard(d) {
   var c = d.consumption || {}, base = c[d.baseline] || 0, ch = base ? (c.live - base) / base : null, vs1 = c.cc_1h ? (c.live - c.cc_1h) / c.cc_1h : null;
-  return '<div class="card kpi hl"><div class="lbl">Overall consumption</div><div class="big ' + (ch != null && ch <= 0 ? 'pos' : 'neg') + '">' + spct(ch) + '</div>' +
+  return '<div class="card kpi hl hero"><div class="lbl">Overall consumption</div><div class="big ' + (ch != null && ch <= 0 ? 'pos' : 'neg') + '">' + spct(ch) + '</div>' +
     '<div class="sub">' + tok(c.live || 0) + ' used vs ' + tok(base) + ' with the ' + esc(d.baseline_label.split(' (')[0]) + ' you had before' +
     (d.baseline === 'old_5m' && vs1 != null ? ' · ' + spct(vs1) + ' vs the 1-hour cache alone' : '') + '</div></div>';
 }
 function weekday(t) { var d = new Date(t * 1000); return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()] + ' ' + clock(t); }
+var PLANTAB = 0;
+function planChart(box, w) {
+  var W = Math.max(320, box.clientWidth), H = 210, L = 42, R = 14, T = 12, B = 24, iw = W - L - R, ih = H - T - B, now = Date.now() / 1000;
+  var top = Math.max(1.1, (w.est || 0) * 1.08, w.used * 1.08);
+  var x = function (t) { return L + iw * (t - w.start) / (w.reset - w.start); }, y = function (v) { return T + ih * (1 - Math.min(v, top) / top); };
+  var g = '', ser = w.series || [];
+  [0, 0.25, 0.5, 0.75].forEach(function (v) { g += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + y(v) + '" y2="' + y(v) + '" stroke="#efeff3"/><text x="' + (L - 6) + '" y="' + (y(v) + 4) + '" text-anchor="end">' + Math.round(100 * v) + '%</text>'; });
+  g += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + y(1) + '" y2="' + y(1) + '" stroke="#c2410c" stroke-dasharray="4 3"/><text x="' + (L - 6) + '" y="' + (y(1) + 4) + '" text-anchor="end" style="fill:#c2410c">100%</text>';
+  var week = w.reset - w.start > 86400;
+  for (var t = Math.ceil(w.start / 3600) * 3600; t <= w.reset; t += 3600) {
+    var d = new Date(t * 1000);
+    if (week ? d.getHours() === 0 : true) {
+      if (!week && (d.getHours() % 1)) continue;
+      g += '<line x1="' + x(t) + '" x2="' + x(t) + '" y1="' + T + '" y2="' + (T + ih) + '" stroke="#f4f4f6"/>';
+      g += '<text x="' + x(t) + '" y="' + (H - 6) + '" text-anchor="middle">' + (week ? ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()] + ' ' + d.getDate() : clock(t)) + '</text>';
+    }
+  }
+  if (ser.length) {
+    var pa = ser.map(function (p) { return x(p[0]).toFixed(1) + ',' + y(p[1]).toFixed(1); }).join(' ');
+    if (ser[0][2] != null) {
+      var pb = ser.map(function (p) { return x(p[0]).toFixed(1) + ',' + y(p[2]).toFixed(1); }).join(' ');
+      g += '<polygon points="' + pb + ' ' + ser.slice().reverse().map(function (p) { return x(p[0]).toFixed(1) + ',' + y(p[1]).toFixed(1); }).join(' ') + '" fill="rgba(194,65,12,.08)"/>';
+      g += '<polyline points="' + pb + '" fill="none" stroke="#c2410c" stroke-width="2" stroke-dasharray="5 4" stroke-linejoin="round"/>';
+    }
+    g += '<polyline points="' + pa + '" fill="none" stroke="#2f6fdf" stroke-width="2.5" stroke-linejoin="round"/>';
+  }
+  g += '<line x1="' + x(now) + '" x2="' + x(now) + '" y1="' + T + '" y2="' + (T + ih) + '" stroke="#1d1d1f" stroke-opacity=".18"/><text x="' + x(now) + '" y="' + (T + 9) + '" text-anchor="middle" style="fill:#6e6e73">now</text>';
+  (w.samples || []).forEach(function (sm) { g += '<circle cx="' + x(sm[0]) + '" cy="' + y(sm[1]) + '" r="3.5" fill="#fff" stroke="#2f6fdf" stroke-width="1.5"><title>Meter read ' + weekday(sm[0]) + ': ' + Math.round(100 * sm[1]) + '%</title></circle>'; });
+  if (w.hit_at) g += '<circle cx="' + x(w.hit_at) + '" cy="' + y(1) + '" r="5" fill="#c2410c"/><text x="' + (x(w.hit_at) - 8) + '" y="' + (y(1) - 8) + '" text-anchor="end" style="fill:#c2410c;font-weight:600">limit hit ' + weekday(w.hit_at) + '</text>';
+  g += '<line id="phov" x1="0" x2="0" y1="' + T + '" y2="' + (T + ih) + '" stroke="#1d1d1f" stroke-opacity=".25" style="display:none"/><rect id="phit" x="' + L + '" y="' + T + '" width="' + iw + '" height="' + ih + '" fill="transparent"/>';
+  box.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" height="' + H + '">' + g + '</svg><div class="tip" id="ptip"></div>';
+  var tip = box.querySelector('#ptip'), hov = box.querySelector('#phov');
+  box.querySelector('#phit').onmousemove = function (ev) {
+    var r = box.getBoundingClientRect(), px = (ev.clientX - r.left) * W / r.width, t = w.start + (px - L) / iw * (w.reset - w.start);
+    if (!ser.length || t > ser[ser.length - 1][0] + 1) { tip.style.opacity = 0; hov.style.display = 'none'; return; }
+    var p = ser[0]; for (var i = 0; i < ser.length && ser[i][0] <= t; i++) p = ser[i];
+    hov.setAttribute('x1', x(p[0])); hov.setAttribute('x2', x(p[0])); hov.style.display = '';
+    tip.innerHTML = '<div style="opacity:.7">' + weekday(p[0]) + '</div>Used <b>' + Math.round(100 * p[1]) + '%</b>' + (p[2] != null ? '<br><span style="color:#ffb38a">Without keep-alive <b>' + Math.round(100 * p[2]) + '%</b></span>' : '');
+    tip.style.opacity = 1; var tx = x(p[0]) * r.width / W + 14; if (tx > r.width - 200) tx = x(p[0]) * r.width / W - 200; tip.style.left = tx + 'px'; tip.style.top = '20px';
+  };
+  box.querySelector('#phit').onmouseleave = function () { tip.style.opacity = 0; hov.style.display = 'none'; };
+}
 function renderPlan(plan) {
   var el = document.getElementById('plan');
   if (!el) return;
   if (!plan) { el.innerHTML = ''; return; }
-  el.innerHTML = plan.map(function (a) {
-    var rows = a.windows.map(function (w) {
-      var used = Math.min(1, w.used), est = w.est, ghost = est == null ? 0 : Math.max(0, Math.min(1, est) - used);
-      var bar = '<div class="plan-bar"><i style="width:' + (100 * used).toFixed(1) + '%"></i>' + (ghost > 0 ? '<b style="left:' + (100 * used).toFixed(1) + '%;width:' + (100 * ghost).toFixed(1) + '%"></b>' : '') + (est != null && est > 1 ? '<em></em>' : '') + '</div>';
-      var what;
-      if (est == null) what = '';
-      else if (est > 1 && w.hit_at) what = 'without keep-alive: <b class="neg">limit hit ' + weekday(w.hit_at) + '</b>, ' + dur(w.reset - w.hit_at) + ' before reset (≈' + Math.round(100 * est) + '%)';
-      else what = 'without keep-alive: <b>≈' + Math.round(100 * est) + '%</b> <span class="pos">(' + Math.round(100 * (est - w.used)) + (Math.round(100 * (est - w.used)) === 1 ? ' point' : ' points') + ' more)</span>';
-      return '<div class="plan-row"><div class="plan-name">' + esc(w.name) + '</div><div class="plan-main">' + bar + '<div class="sub"><b style="color:var(--ink)">' + Math.round(100 * w.used) + '% used</b> · ' + what + '</div></div><div class="sub plan-reset">resets ' + weekday(w.reset) + '<br>in ' + dur(w.reset - Date.now() / 1000) + '</div></div>';
-    }).join('');
-    return '<div class="card plancard"><div class="charthead" style="margin-bottom:2px"><b style="font-size:13px">Claude plan</b><span class="sub">account ' + esc(a.id) + ' · meter read ' + dur(Date.now() / 1000 - a.updated) + ' ago' + (a.estimated ? ' · estimate assumes this plan is only used through opencodex' : ' · several accounts: no estimate') + '</span></div>' + rows + '</div>';
-  }).join('');
+  var a = plan[0], ws = a.windows, w = ws[Math.min(PLANTAB, ws.length - 1)];
+  var est = w.est, what;
+  if (est == null) what = '';
+  else if (est > 1 && w.hit_at) what = ' · without keep-alive: <b class="neg">limit hit ' + weekday(w.hit_at) + '</b>, ' + dur(w.reset - w.hit_at) + ' before reset';
+  else { var pts = Math.round(100 * (est - w.used)); what = ' · without keep-alive: <b>≈' + Math.round(100 * est) + '%</b> (' + pts + (pts === 1 ? ' point' : ' points') + ' more)'; }
+  el.innerHTML = '<div class="card plancard"><div class="charthead"><b style="font-size:13px">Claude plan</b><div class="seg" id="ptabs"></div>' +
+    '<div class="legend"><span><i style="background:#2f6fdf"></i>Used</span><span><i style="background:#c2410c"></i>Without keep-alive (est.)</span><span><i style="background:#fff;box-shadow:inset 0 0 0 1.5px #2f6fdf;border-radius:50%"></i>Meter readings</span></div></div>' +
+    '<div class="sub" style="margin-bottom:4px"><b style="color:var(--ink);font-size:13px">' + Math.round(100 * w.used) + '% used</b>' + what + ' · resets ' + weekday(w.reset) + ' (in ' + dur(w.reset - Date.now() / 1000) + ')</div>' +
+    '<div class="chart" id="pchart"></div>' +
+    '<div class="sub" style="margin-top:4px">Account ' + esc(a.id) + ' · meter read ' + dur(Date.now() / 1000 - a.updated) + ' ago. The line before the first reading is rebuilt from what this machine sent, scaled to the meter' + (a.estimated ? '; the estimate assumes this plan is only used through opencodex.' : '; several accounts, so no estimate.') + (plan.length > 1 ? ' Showing 1 of ' + plan.length + ' accounts.' : '') + '</div></div>';
+  seg(document.getElementById('ptabs'), ws.map(function (x, i) { return [String(i), x.name]; }), String(Math.min(PLANTAB, ws.length - 1)), function (k) { PLANTAB = +k; renderPlan(plan); });
+  planChart(document.getElementById('pchart'), w);
 }
 function overview() {
   var app = document.getElementById('app');
@@ -1104,11 +1223,10 @@ function overview() {
       var t = d.totals, saved = t.saved || 0, cost = t.cost || 0, net = saved - cost, netu = (t.saved_usd || 0) - (t.cost_usd || 0);
       document.getElementById('span').textContent = when(d.t_from) + ' → now · ' + (d.bucket >= 86400 ? 'daily' : dur(d.bucket)) + ' buckets';
       var k = document.getElementById('kpis'); k.classList.remove('loading');
-      k.innerHTML =
-        useCard(d) + '<div class="card kpi"><div class="lbl">Net saved</div><div class="big ' + (net >= 0 ? 'blue' : 'neg') + '">' + stok(net) + '</div><div class="sub">' + usd(netu) + ' at API prices · ' + (cost ? (saved / cost).toFixed(1) + '× return on cost' : 'no keep-alives yet') + (d.spend ? ' · ' + pct(net / d.spend) + ' of total use' : '') + '</div></div>' +
-        '<div class="card kpi"><div class="lbl">Rewrites avoided</div><div class="big pos">' + tok(saved) + '</div><div class="sub">' + (t.rescues || 0) + ' time' + (t.rescues === 1 ? '' : 's') + ' you came back after an hour+ to a warm cache · ' + usd(t.saved_usd || 0) + '</div></div>' +
-        '<div class="card kpi"><div class="lbl">Keep-alive cost</div><div class="big neg">' + tok(cost) + '</div><div class="sub">' + (t.pings || 0) + ' keep-alives' + (t.failed ? ', ' + t.failed + ' failed' : '') + ' · ' + usd(t.cost_usd || 0) + '</div></div>' +
-        '<div class="card kpi"><div class="lbl">Left on the table</div><div class="big" style="color:var(--amber)">' + tok(t.missed || 0) + '</div><div class="sub"><a href="/decisions?range=' + range + '&f=missed">' + (t.missed_n || 0) + ' cold return' + (t.missed_n === 1 ? '' : 's') + '</a> where a keep-alive would have paid' + (d.reasons.length ? ' · mostly ' + esc(d.reasons[0][0]) : '') + '</div></div>';
+      k.innerHTML = useCard(d) +
+        '<div class="card kpi small"><div class="lbl">Net saved</div><div class="big ' + (net >= 0 ? 'blue' : 'neg') + '">' + stok(net) + '</div><div class="sub">' + usd(netu) + ' at API prices · ' + (cost ? (saved / cost).toFixed(1) + '× its cost' : 'no keep-alives yet') + '</div></div>' +
+        '<div class="card kpi small"><div class="lbl">Rewrites avoided</div><div class="big pos">' + tok(saved) + '</div><div class="sub">' + (t.rescues || 0) + ' warm return' + (t.rescues === 1 ? '' : 's') + ' after an hour+ · ' + usd(t.saved_usd || 0) + '</div></div>' +
+        '<div class="card kpi small"><div class="lbl">Keep-alive cost</div><div class="big neg">' + tok(cost) + '</div><div class="sub">' + (t.pings || 0) + ' keep-alives' + (t.failed ? ', ' + t.failed + ' failed' : '') + ' · ' + usd(t.cost_usd || 0) + '</div></div>';
       paint();
     }).catch(function (e) { document.getElementById('kpis').innerHTML = '<div class="card empty">Could not load: ' + esc(e.message).slice(0, 300) + '</div>'; });
   }
@@ -1277,5 +1395,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('KEEPALIVE_DASHBOARD_PORT', '8797'))
     print(f'dashboard on http://127.0.0.1:{port}/')
     threading.Thread(target=STORE.model, daemon=True).start()   # warm the cache before the first page load
+    if QUOTA.exists() and not (D / 'keepalive_proxy.py').exists():
+        threading.Thread(target=record_plan, args=(STORE,), daemon=True).start()
     http.server.ThreadingHTTPServer(('127.0.0.1', port), H).serve_forever()
 
