@@ -543,51 +543,54 @@ QUOTA = HOME / 'provider-account-quota-cache.json'   # opencodex's cache of each
 
 
 def plan_window(M, name, start, reset, util):
-    """Where a plan meter would be without keep-alives. The meter's used share is spread over everything this
-    machine sent in the window (as priced in token-equivalents); the same requests under the cache you had
-    before then give the estimate. Requests from before install count the same both ways."""
+    """Where a plan meter would be under other cache setups. The meter's used share is spread over everything
+    this machine sent in the window (priced in token-equivalents); the same requests are then replayed with the
+    1-hour cache and no keep-alives (est) and, for opencodex, with the 5-minute cache you had before install
+    (est_before). Requests from before install count the same in every version."""
     now = time.time()
-    ev = []
+    ev = []   # (t, actual, 1-hour cache without keep-alives, 5-minute cache)
     for t, model, vals, out in replay(M):
         if start <= t <= now:
-            ev.append((t, vals['live'] + out, vals[BASELINE] + out))
+            ev.append((t, vals['live'] + out, vals['cc_1h'] + out, vals['old_5m'] + out))
     for d in M['events']:
         if d['kind'] == 'kept' and start <= d['t'] <= now:
-            ev.append((d['t'], d['cost'], 0.0))
+            ev.append((d['t'], d['cost'], 0.0, 0.0))
     if M['t0'] > start:
         for v in M['streams'].values():
             for r in v:
                 if start <= r['t'] < M['t0']:
                     c = max(0, r['P'] - r['cr'] - r['cc']) + W5 * r['cc'] + rm(r['model']) * r['cr'] + OUTW * r['out']
-                    ev.append((r['t'], c, c))
+                    ev.append((r['t'], c, c, c))
     ev.sort()
+    before = BASELINE == 'old_5m'
     actual = sum(e[1] for e in ev)
-    base = sum(e[2] for e in ev)
-    out = dict(name=name, start=start, reset=reset, used=util, actual=actual, base=base, est=None, hit_at=None, series=[], samples=[])
+    out = dict(name=name, start=start, reset=reset, used=util, actual=actual, est=None, hit_at=None,
+               est_before=None, hit_before=None, series=[], samples=[])
     if actual <= 0 or util <= 0:
         return out
     k = util / actual
-    # the line so far: cumulative use in the window, scaled so it ends at the meter's current reading
+    # the lines so far: cumulative use in the window, scaled so "used" ends at the meter's current reading
     step = 3600 if reset - start > 86400 else 600
-    ca = cb = 0.0
+    c = [0.0, 0.0, 0.0]
+    hit = [None, None]
     i = 0
     t = start
-    out['series'].append((round(start), 0.0, 0.0))
+    out['series'].append((round(start), 0.0, 0.0, 0.0 if before else None))
     while True:
         t = min(t + step, now)
         while i < len(ev) and ev[i][0] <= t:
-            ca += ev[i][1]; cb += ev[i][2]; i += 1
-        out['series'].append((round(t), round(k * ca, 4), round(k * cb, 4)))
+            for j in range(3):
+                c[j] += ev[i][j + 1]
+            for j in range(2):
+                if hit[j] is None and k * c[j + 1] >= 1:
+                    hit[j] = ev[i][0]
+            i += 1
+        out['series'].append((round(t), round(k * c[0], 4), round(k * c[1], 4), round(k * c[2], 4) if before else None))
         if t >= now:
             break
-    out['est'] = k * base
-    if out['est'] >= 1:
-        cum = 0.0
-        for t, _, b in ev:
-            cum += b
-            if k * cum >= 1:
-                out['hit_at'] = t
-                break
+    out['est'], out['hit_at'] = k * c[1], hit[0]
+    if before:
+        out['est_before'], out['hit_before'] = k * c[2], hit[1]
     return out
 
 
@@ -640,7 +643,9 @@ def record_plan(store):
                 for a in plan:
                     if a['id'] == acct:
                         for w in a['windows']:
-                            rec['est_' + ('week' if w['name'] == 'This week' else 'five')] = None if w['est'] is None else round(100 * w['est'], 1)
+                            f = 'week' if w['name'] == 'This week' else 'five'
+                            rec['est_' + f] = None if w['est'] is None else round(100 * w['est'], 1)
+                            rec['before_' + f] = None if w['est_before'] is None else round(100 * w['est_before'], 1)
                 with open(PLAN_LOG, 'a') as f:
                     f.write(json.dumps(rec) + '\n')
                 last[acct] = t
@@ -668,8 +673,8 @@ def plan_usage(M, samples=True):
             if samples:
                 w['samples'] = plan_samples(acct['id'], 'week' if pk == 'weeklyPercent' else 'five', reset)
             if not acct['estimated']:
-                w['est'] = w['hit_at'] = None
-                w['series'] = [(t, a, None) for t, a, _ in w['series']]
+                w['est'] = w['hit_at'] = w['est_before'] = w['hit_before'] = None
+                w['series'] = [(t, a, None, None) for t, a, _, _ in w['series']]
             acct['windows'].append(w)
         if acct['windows']:
             out.append(acct)
@@ -1145,7 +1150,7 @@ function weekday(t) { var d = new Date(t * 1000); return ['Sun', 'Mon', 'Tue', '
 var PLANTAB = 0;
 function planChart(box, w) {
   var W = Math.max(320, box.clientWidth), H = 210, L = 42, R = 14, T = 12, B = 24, iw = W - L - R, ih = H - T - B, now = Date.now() / 1000;
-  var top = Math.max(1.1, (w.est || 0) * 1.08, w.used * 1.08);
+  var top = Math.max(1.1, (w.est || 0) * 1.08, (w.est_before || 0) * 1.08, w.used * 1.08);
   var x = function (t) { return L + iw * (t - w.start) / (w.reset - w.start); }, y = function (v) { return T + ih * (1 - Math.min(v, top) / top); };
   var g = '', ser = w.series || [];
   [0, 0.25, 0.5, 0.75].forEach(function (v) { g += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + y(v) + '" y2="' + y(v) + '" stroke="#efeff3"/><text x="' + (L - 6) + '" y="' + (y(v) + 4) + '" text-anchor="end">' + Math.round(100 * v) + '%</text>'; });
@@ -1160,17 +1165,16 @@ function planChart(box, w) {
     }
   }
   if (ser.length) {
-    var pa = ser.map(function (p) { return x(p[0]).toFixed(1) + ',' + y(p[1]).toFixed(1); }).join(' ');
-    if (ser[0][2] != null) {
-      var pb = ser.map(function (p) { return x(p[0]).toFixed(1) + ',' + y(p[2]).toFixed(1); }).join(' ');
-      g += '<polygon points="' + pb + ' ' + ser.slice().reverse().map(function (p) { return x(p[0]).toFixed(1) + ',' + y(p[1]).toFixed(1); }).join(' ') + '" fill="rgba(194,65,12,.08)"/>';
-      g += '<polyline points="' + pb + '" fill="none" stroke="#c2410c" stroke-width="2" stroke-dasharray="5 4" stroke-linejoin="round"/>';
-    }
-    g += '<polyline points="' + pa + '" fill="none" stroke="#2f6fdf" stroke-width="2.5" stroke-linejoin="round"/>';
+    var line = function (j) { return ser.map(function (p) { return x(p[0]).toFixed(1) + ',' + y(p[j]).toFixed(1); }).join(' '); };
+    var top3 = ser[0][3] != null ? 3 : 2;
+    if (ser[0][2] != null) g += '<polygon points="' + line(top3) + ' ' + ser.slice().reverse().map(function (p) { return x(p[0]).toFixed(1) + ',' + y(p[1]).toFixed(1); }).join(' ') + '" fill="rgba(47,111,223,.07)"/>';
+    if (ser[0][3] != null) g += '<polyline points="' + line(3) + '" fill="none" stroke="#8e8e93" stroke-width="2" stroke-dasharray="5 4" stroke-linejoin="round"/>';
+    if (ser[0][2] != null) g += '<polyline points="' + line(2) + '" fill="none" stroke="#8fb4f2" stroke-width="2" stroke-dasharray="5 4" stroke-linejoin="round"/>';
+    g += '<polyline points="' + line(1) + '" fill="none" stroke="#2f6fdf" stroke-width="2.5" stroke-linejoin="round"/>';
   }
   g += '<line x1="' + x(now) + '" x2="' + x(now) + '" y1="' + T + '" y2="' + (T + ih) + '" stroke="#1d1d1f" stroke-opacity=".18"/><text x="' + x(now) + '" y="' + (T + 9) + '" text-anchor="middle" style="fill:#6e6e73">now</text>';
   (w.samples || []).forEach(function (sm) { g += '<circle cx="' + x(sm[0]) + '" cy="' + y(sm[1]) + '" r="3.5" fill="#fff" stroke="#2f6fdf" stroke-width="1.5"><title>Meter read ' + weekday(sm[0]) + ': ' + Math.round(100 * sm[1]) + '%</title></circle>'; });
-  if (w.hit_at) g += '<circle cx="' + x(w.hit_at) + '" cy="' + y(1) + '" r="5" fill="#c2410c"/><text x="' + (x(w.hit_at) - 8) + '" y="' + (y(1) - 8) + '" text-anchor="end" style="fill:#c2410c;font-weight:600">limit hit ' + weekday(w.hit_at) + '</text>';
+  [[w.hit_at, 'without keep-alive'], [w.hit_before, 'with the 5-min cache']].forEach(function (h) { if (h[0]) g += '<circle cx="' + x(h[0]) + '" cy="' + y(1) + '" r="5" fill="#c2410c"/><text x="' + (x(h[0]) - 8) + '" y="' + (y(1) - 8) + '" text-anchor="end" style="fill:#c2410c;font-weight:600">' + h[1] + ': limit hit ' + weekday(h[0]) + '</text>'; });
   g += '<line id="phov" x1="0" x2="0" y1="' + T + '" y2="' + (T + ih) + '" stroke="#1d1d1f" stroke-opacity=".25" style="display:none"/><rect id="phit" x="' + L + '" y="' + T + '" width="' + iw + '" height="' + ih + '" fill="transparent"/>';
   box.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" height="' + H + '">' + g + '</svg><div class="tip" id="ptip"></div>';
   var tip = box.querySelector('#ptip'), hov = box.querySelector('#phov');
@@ -1179,7 +1183,7 @@ function planChart(box, w) {
     if (!ser.length || t > ser[ser.length - 1][0] + 1) { tip.style.opacity = 0; hov.style.display = 'none'; return; }
     var p = ser[0]; for (var i = 0; i < ser.length && ser[i][0] <= t; i++) p = ser[i];
     hov.setAttribute('x1', x(p[0])); hov.setAttribute('x2', x(p[0])); hov.style.display = '';
-    tip.innerHTML = '<div style="opacity:.7">' + weekday(p[0]) + '</div>Used <b>' + Math.round(100 * p[1]) + '%</b>' + (p[2] != null ? '<br><span style="color:#ffb38a">Without keep-alive <b>' + Math.round(100 * p[2]) + '%</b></span>' : '');
+    tip.innerHTML = '<div style="opacity:.7">' + weekday(p[0]) + '</div>Used <b>' + Math.round(100 * p[1]) + '%</b>' + (p[2] != null ? '<br><span style="color:#b9d0f7">1-hour cache, no keep-alive <b>' + Math.round(100 * p[2]) + '%</b></span>' : '') + (p[3] != null ? '<br><span style="opacity:.75">5-minute cache (before) <b>' + Math.round(100 * p[3]) + '%</b></span>' : '');
     tip.style.opacity = 1; var tx = x(p[0]) * r.width / W + 14; if (tx > r.width - 200) tx = x(p[0]) * r.width / W - 200; tip.style.left = tx + 'px'; tip.style.top = '20px';
   };
   box.querySelector('#phit').onmouseleave = function () { tip.style.opacity = 0; hov.style.display = 'none'; };
@@ -1189,12 +1193,15 @@ function renderPlan(plan) {
   if (!el) return;
   if (!plan) { el.innerHTML = ''; return; }
   var a = plan[0], ws = a.windows, w = ws[Math.min(PLANTAB, ws.length - 1)];
-  var est = w.est, what;
-  if (est == null) what = '';
-  else if (est > 1 && w.hit_at) what = ' · without keep-alive: <b class="neg">limit hit ' + weekday(w.hit_at) + '</b>, ' + dur(w.reset - w.hit_at) + ' before reset';
-  else { var pts = Math.round(100 * (est - w.used)); what = ' · without keep-alive: <b>≈' + Math.round(100 * est) + '%</b> (' + pts + (pts === 1 ? ' point' : ' points') + ' more)'; }
+  var said = function (est, hit, label) {
+    if (est == null) return '';
+    if (est > 1 && hit) return ' · ' + label + ': <b class="neg">limit hit ' + weekday(hit) + '</b>';
+    var pts = Math.round(100 * (est - w.used));
+    return ' · ' + label + ': <b>≈' + Math.round(100 * est) + '%</b> (' + (pts >= 0 ? '+' : '−') + Math.abs(pts) + (Math.abs(pts) === 1 ? ' point' : ' points') + ')';
+  };
+  var what = said(w.est, w.hit_at, '1-hour cache without keep-alive') + said(w.est_before, w.hit_before, '5-minute cache you had before');
   el.innerHTML = '<div class="card plancard"><div class="charthead"><b style="font-size:13px">Claude plan</b><div class="seg" id="ptabs"></div>' +
-    '<div class="legend"><span><i style="background:#2f6fdf"></i>Used</span><span><i style="background:#c2410c"></i>Without keep-alive (est.)</span><span><i style="background:#fff;box-shadow:inset 0 0 0 1.5px #2f6fdf;border-radius:50%"></i>Meter readings</span></div></div>' +
+    '<div class="legend"><span><i style="background:#2f6fdf"></i>Used</span>' + (w.est != null ? '<span><i style="background:#8fb4f2"></i>1-hour cache, no keep-alive (est.)</span>' : '') + (w.est_before != null ? '<span><i style="background:#8e8e93"></i>5-minute cache, before install (est.)</span>' : '') + '<span><i style="background:#fff;box-shadow:inset 0 0 0 1.5px #2f6fdf;border-radius:50%"></i>Meter readings</span></div></div>' +
     '<div class="sub" style="margin-bottom:4px"><b style="color:var(--ink);font-size:13px">' + Math.round(100 * w.used) + '% used</b>' + what + ' · resets ' + weekday(w.reset) + ' (in ' + dur(w.reset - Date.now() / 1000) + ')</div>' +
     '<div class="chart" id="pchart"></div>' +
     '<div class="sub" style="margin-top:4px">Account ' + esc(a.id) + ' · meter read ' + dur(Date.now() / 1000 - a.updated) + ' ago. The line before the first reading is rebuilt from what this machine sent, scaled to the meter' + (a.estimated ? '; the estimate assumes this plan is only used through opencodex.' : '; several accounts, so no estimate.') + (plan.length > 1 ? ' Showing 1 of ' + plan.length + ' accounts.' : '') + '</div></div>';
