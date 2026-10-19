@@ -20,6 +20,7 @@ CODEX_HOME = pathlib.Path(os.environ.get('CODEX_HOME', pathlib.Path.home() / '.c
 READ = {'claude-opus-5-5': 0.05, 'claude-sonnet-5-5': 0.05, 'claude-fable-5-1': 0.025}
 PRICE = {'claude-opus-5-5': 4.0}            # US$ per million base input tokens (API list); others assumed equal
 W5, W60, TTL, LEAD = 1.25, 2.0, 3600, 60
+OUTW = 5.0   # output tokens cost 5x input; plan meters count them too
 DEFAULT_POLICY = {'mode': 'rule', 'max_idle_s': 4 * 3600, 'min_prompt_tokens': 40000, 'daily_cap': 400, 'shared_floor_tokens': 30000}
 RANGES = {'6h': 6 * 3600, '24h': 86400, '3d': 3 * 86400, '7d': 7 * 86400, '30d': 30 * 86400, 'all': None}
 TZ = datetime.datetime.now().astimezone().tzinfo
@@ -258,7 +259,7 @@ class Store:
     def _reset(self):
         st = _json(D / 'state.json')
         self.t0 = st.get('switched_at', time.time() - 86400)
-        self.usage = Tail(USAGE, parse_usage(self.t0 - 86400))
+        self.usage = Tail(USAGE, parse_usage(min(self.t0 - 86400, time.time() - 8 * 86400)))   # covers the weekly plan window
         self.ka = Tail(KA, parse_ka(self.t0))
 
     def model(self):
@@ -523,19 +524,82 @@ def api_overview(store, rng):
             if s:
                 s['missed'] += g['best']; s['missed_n'] += 1
     use = collections.Counter()
-    for t, model, vals in replay(M):
+    for t, model, vals, out in replay(M):
         if t < t_from:
             continue
         sl = slot(t)
         for k, val in vals.items():
-            use[k] += val; use[k + '_usd'] += usd(val, model)
+            use[k] += val + out; use[k + '_usd'] += usd(val + out, model)
             if sl:
-                sl['c_' + k] += val
+                sl['c_' + k] += val + out
     use['live'] += tot['cost']; use['live_usd'] += tot['cost_usd']
     spend = use['live']
     return dict(now=now, range=rng, t_from=t_from, bucket=b, head=header(store, M), spend=spend, consumption=dict(use),
                 baseline=BASELINE, baseline_label=BASELINE_LABEL[BASELINE],
                 totals=dict(tot), reasons=reasons.most_common(), series=list(buckets.values()))
+
+
+QUOTA = HOME / 'provider-account-quota-cache.json'   # opencodex's cache of each Claude account's plan meters
+
+
+def plan_window(M, name, start, reset, util):
+    """Where a plan meter would be without keep-alives. The meter's used share is spread over everything this
+    machine sent in the window (as priced in token-equivalents); the same requests under the cache you had
+    before then give the estimate. Requests from before install count the same both ways."""
+    now = time.time()
+    ev = []
+    for t, model, vals, out in replay(M):
+        if start <= t <= now:
+            ev.append((t, vals['live'] + out, vals[BASELINE] + out))
+    for d in M['events']:
+        if d['kind'] == 'kept' and start <= d['t'] <= now:
+            ev.append((d['t'], d['cost'], 0.0))
+    if M['t0'] > start:
+        for v in M['streams'].values():
+            for r in v:
+                if start <= r['t'] < M['t0']:
+                    c = max(0, r['P'] - r['cr'] - r['cc']) + W5 * r['cc'] + rm(r['model']) * r['cr'] + OUTW * r['out']
+                    ev.append((r['t'], c, c))
+    ev.sort()
+    actual = sum(e[1] for e in ev)
+    base = sum(e[2] for e in ev)
+    out = dict(name=name, start=start, reset=reset, used=util, actual=actual, base=base, est=None, hit_at=None)
+    if actual <= 0 or util <= 0:
+        return out
+    k = util / actual
+    out['est'] = k * base
+    if out['est'] >= 1:
+        cum = 0.0
+        for t, _, b in ev:
+            cum += b
+            if k * cum >= 1:
+                out['hit_at'] = t
+                break
+    return out
+
+
+def plan_usage(M):
+    if (D / 'keepalive_proxy.py').exists():
+        return None
+    q = _json(QUOTA)
+    rows = [(k, v) for k, v in (q.get('rows') or {}).items() if k.startswith('anthropic') and isinstance(v, dict)]
+    if not rows:
+        return None
+    now = time.time()
+    out = []
+    for k, v in rows:
+        acct = dict(id=(k[-32:] if len(k) > 40 else k)[:6], updated=_num(v.get('updatedAt')) / 1000, windows=[], estimated=len(rows) == 1)
+        for name, pk, rk, span in (('This week', 'weeklyPercent', 'weeklyResetAt', 7 * 86400), ('5-hour window', 'fiveHourPercent', 'fiveHourResetAt', 5 * 3600)):
+            if v.get(pk) is None or not v.get(rk) or v[rk] / 1000 < now:
+                continue
+            reset = v[rk] / 1000
+            w = plan_window(M, name, reset - span, reset, v[pk] / 100)
+            if not acct['estimated']:
+                w['est'] = w['hit_at'] = None
+            acct['windows'].append(w)
+        if acct['windows']:
+            out.append(acct)
+    return out or None
 
 
 def api_live(store):
@@ -590,7 +654,7 @@ def api_live(store):
             rows.append(row)
     rows.sort(key=lambda r: r['expires'])
     expired.sort(key=lambda r: -r['expires'])
-    return dict(now=now, head=header(store, M), chats=rows, expired=expired[:30], small=small)
+    return dict(now=now, head=header(store, M), chats=rows, expired=expired[:30], small=small, plan=plan_usage(M))
 
 
 def api_decisions(store, rng):
@@ -672,7 +736,9 @@ def api_badge(store):
     live = api_live(store)
     due = [c['next_check'] for c in live['chats'] if c['verdict'] == 'keep']
     pings = [d['t'] for d in M['events'] if d['kind'] == 'kept']
-    return dict(now=now, use_pct=use_pct, baseline_label=BASELINE_LABEL[BASELINE].split(' (')[0], on=M['disabled'] is None, disabled=(M['disabled'] or {}).get('reason'), mode=live['head']['mode'],
+    plan = live.get('plan')
+    week = next((w for a in (plan or []) for w in a['windows'] if w['name'] == 'This week'), None)
+    return dict(now=now, use_pct=use_pct, plan_week=week, baseline_label=BASELINE_LABEL[BASELINE].split(' (')[0], on=M['disabled'] is None, disabled=(M['disabled'] or {}).get('reason'), mode=live['head']['mode'],
                 kind='Claude Code' if (D / 'keepalive_proxy.py').exists() else 'opencodex', since=M['t0'],
                 **{k: dict(v) for k, v in out.items()}, warm=len(live['chats']), warm_tokens=sum(c['prompt'] for c in live['chats']),
                 next_keepalive=min(due) if due else None, last_keepalive=max(pings) if pings else None, last_save=last)
@@ -700,7 +766,7 @@ def replay(M):
                 read_1h = min(r['cr'], floor) if gap is not None and gap > TTL + 30 else r['cr']
                 read_5m = min(r['cr'], floor) if gap is not None and gap > 300 else r['cr']
                 yield r['t'], r['model'], {'live': u + W60 * r['cc'] + m * r['cr'], 'cc_1h': u + W60 * (r['P'] - u - read_1h) + m * read_1h,
-                                           'old_5m': u + W5 * (r['P'] - u - read_5m) + m * read_5m}
+                                           'old_5m': u + W5 * (r['P'] - u - read_5m) + m * read_5m}, OUTW * r['out']
             prev = r
 
 
@@ -708,7 +774,7 @@ def baselines(M):
     """The same requests replayed under the 5-minute and 1-hour cache, next to what actually happened."""
     day = lambda t: datetime.datetime.fromtimestamp(t, TZ).strftime('%d/%m')
     tot, usd_tot, daily = collections.Counter(), collections.Counter(), collections.defaultdict(collections.Counter)
-    for t, model, vals in replay(M):
+    for t, model, vals, _out in replay(M):
         for k, val in vals.items():
             tot[k] += val; usd_tot[k] += usd(val, model); daily[day(t)][k] += val
         tot['requests'] += 1
@@ -720,10 +786,10 @@ def baselines(M):
 
 def consumption(M, t_from):
     c = collections.Counter()
-    for t, model, vals in replay(M):
+    for t, model, vals, out in replay(M):
         if t >= t_from:
             for k, val in vals.items():
-                c[k] += val; c[k + '_usd'] += usd(val, model)
+                c[k] += val + out; c[k + '_usd'] += usd(val + out, model)
     for d in M['events']:
         if d['kind'] == 'kept' and d['t'] >= t_from:
             c['live'] += d['cost']; c['live_usd'] += usd(d['cost'], d['model'])
@@ -883,6 +949,15 @@ details summary{cursor:pointer;color:var(--sub);font-size:12.5px;margin:14px 0 8
 .daychart{display:flex;gap:12px;align-items:flex-end;overflow-x:auto} .day{text-align:center} .bars{display:flex;gap:2px;align-items:flex-end;height:114px}
 .bar{width:12px;border-radius:2px 2px 0 0} .old_5m{background:#c7c7cc} .cc_1h{background:#8fb4f2} .live{background:#2f6fdf}
 .loading{opacity:.55;transition:opacity .2s}
+.plancard{margin-top:12px;padding:14px 16px 10px}
+.plan-row{display:grid;grid-template-columns:120px 1fr 120px;gap:16px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
+.plan-row:first-of-type{border-top:0}
+.plan-name{font-size:12.5px;font-weight:560}
+.plan-bar{position:relative;height:10px;background:#efeff3;border-radius:5px;overflow:hidden;margin-bottom:5px}
+.plan-bar i{position:absolute;left:0;top:0;bottom:0;background:var(--blue);border-radius:5px 0 0 5px}
+.plan-bar b{position:absolute;top:0;bottom:0;background:repeating-linear-gradient(-45deg,rgba(194,65,12,.55) 0 4px,rgba(194,65,12,.25) 4px 8px)}
+.plan-bar em{position:absolute;right:0;top:0;bottom:0;width:3px;background:var(--orange)}
+.plan-reset{text-align:right}
 @media(max-width:1120px){.o1{display:none}}
 @media(max-width:820px){.o2{display:none}.chat .t,.chat .sub{max-width:200px}}
 @media (prefers-reduced-motion: reduce){*{transition:none!important}}
@@ -989,10 +1064,28 @@ function useCard(d) {
     '<div class="sub">' + tok(c.live || 0) + ' used vs ' + tok(base) + ' with the ' + esc(d.baseline_label.split(' (')[0]) + ' you had before' +
     (d.baseline === 'old_5m' && vs1 != null ? ' · ' + spct(vs1) + ' vs the 1-hour cache alone' : '') + '</div></div>';
 }
+function weekday(t) { var d = new Date(t * 1000); return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()] + ' ' + clock(t); }
+function renderPlan(plan) {
+  var el = document.getElementById('plan');
+  if (!el) return;
+  if (!plan) { el.innerHTML = ''; return; }
+  el.innerHTML = plan.map(function (a) {
+    var rows = a.windows.map(function (w) {
+      var used = Math.min(1, w.used), est = w.est, ghost = est == null ? 0 : Math.max(0, Math.min(1, est) - used);
+      var bar = '<div class="plan-bar"><i style="width:' + (100 * used).toFixed(1) + '%"></i>' + (ghost > 0 ? '<b style="left:' + (100 * used).toFixed(1) + '%;width:' + (100 * ghost).toFixed(1) + '%"></b>' : '') + (est != null && est > 1 ? '<em></em>' : '') + '</div>';
+      var what;
+      if (est == null) what = '';
+      else if (est > 1 && w.hit_at) what = 'without keep-alive: <b class="neg">limit hit ' + weekday(w.hit_at) + '</b>, ' + dur(w.reset - w.hit_at) + ' before reset (≈' + Math.round(100 * est) + '%)';
+      else what = 'without keep-alive: <b>≈' + Math.round(100 * est) + '%</b> <span class="pos">(' + Math.round(100 * (est - w.used)) + (Math.round(100 * (est - w.used)) === 1 ? ' point' : ' points') + ' more)</span>';
+      return '<div class="plan-row"><div class="plan-name">' + esc(w.name) + '</div><div class="plan-main">' + bar + '<div class="sub"><b style="color:var(--ink)">' + Math.round(100 * w.used) + '% used</b> · ' + what + '</div></div><div class="sub plan-reset">resets ' + weekday(w.reset) + '<br>in ' + dur(w.reset - Date.now() / 1000) + '</div></div>';
+    }).join('');
+    return '<div class="card plancard"><div class="charthead" style="margin-bottom:2px"><b style="font-size:13px">Claude plan</b><span class="sub">account ' + esc(a.id) + ' · meter read ' + dur(Date.now() / 1000 - a.updated) + ' ago' + (a.estimated ? ' · estimate assumes this plan is only used through opencodex' : ' · several accounts: no estimate') + '</span></div>' + rows + '</div>';
+  }).join('');
+}
 function overview() {
   var app = document.getElementById('app');
   app.innerHTML = '<div class="bar-row"><div class="seg" id="range"></div><span class="sub" id="span"></span></div><div id="kpis" class="kpis"></div>' +
-    '<div class="card chartcard"><div class="charthead"><b style="font-size:13px" id="ctitle"></b><div class="seg" id="mode"></div><div class="legend" id="legend"></div></div><div class="chart" id="chart"></div></div>' +
+    '<div id="plan"></div><div class="card chartcard"><div class="charthead"><b style="font-size:13px" id="ctitle"></b><div class="seg" id="mode"></div><div class="legend" id="legend"></div></div><div class="chart" id="chart"></div></div>' +
     '<h2>On cache now</h2><p class="sub">Chats whose 1-hour cache is still warm. About a minute before it expires the keep-alive checks the chat: if the chance you come back within the next hour beats break-even it re-reads the cache (cheap), otherwise it lets it expire. Updates every 30 s.</p>' +
     '<div class="stats" id="livestats"></div><div class="card flush tablecard" id="live"></div><div id="expired"></div>';
   var range = param('range', '24h'), mode = param('chart', 'use'), last = null;
@@ -1012,7 +1105,7 @@ function overview() {
       document.getElementById('span').textContent = when(d.t_from) + ' → now · ' + (d.bucket >= 86400 ? 'daily' : dur(d.bucket)) + ' buckets';
       var k = document.getElementById('kpis'); k.classList.remove('loading');
       k.innerHTML =
-        useCard(d) + '<div class="card kpi"><div class="lbl">Net saved</div><div class="big ' + (net >= 0 ? 'blue' : 'neg') + '">' + stok(net) + '</div><div class="sub">' + usd(netu) + ' at API prices · ' + (cost ? (saved / cost).toFixed(1) + '× return on cost' : 'no keep-alives yet') + (d.spend ? ' · ' + pct(net / d.spend) + ' of input spend' : '') + '</div></div>' +
+        useCard(d) + '<div class="card kpi"><div class="lbl">Net saved</div><div class="big ' + (net >= 0 ? 'blue' : 'neg') + '">' + stok(net) + '</div><div class="sub">' + usd(netu) + ' at API prices · ' + (cost ? (saved / cost).toFixed(1) + '× return on cost' : 'no keep-alives yet') + (d.spend ? ' · ' + pct(net / d.spend) + ' of total use' : '') + '</div></div>' +
         '<div class="card kpi"><div class="lbl">Rewrites avoided</div><div class="big pos">' + tok(saved) + '</div><div class="sub">' + (t.rescues || 0) + ' time' + (t.rescues === 1 ? '' : 's') + ' you came back after an hour+ to a warm cache · ' + usd(t.saved_usd || 0) + '</div></div>' +
         '<div class="card kpi"><div class="lbl">Keep-alive cost</div><div class="big neg">' + tok(cost) + '</div><div class="sub">' + (t.pings || 0) + ' keep-alives' + (t.failed ? ', ' + t.failed + ' failed' : '') + ' · ' + usd(t.cost_usd || 0) + '</div></div>' +
         '<div class="card kpi"><div class="lbl">Left on the table</div><div class="big" style="color:var(--amber)">' + tok(t.missed || 0) + '</div><div class="sub"><a href="/decisions?range=' + range + '&f=missed">' + (t.missed_n || 0) + ' cold return' + (t.missed_n === 1 ? '' : 's') + '</a> where a keep-alive would have paid' + (d.reasons.length ? ' · mostly ' + esc(d.reasons[0][0]) : '') + '</div></div>';
@@ -1023,6 +1116,7 @@ function overview() {
   function loadLive() { getJSON('/api/live').then(function (d) { live = d; renderLive(); }).catch(function () {}); }
   function renderLive() {
     var d = live, now = Date.now() / 1000, rows = d.chats;
+    renderPlan(d.plan);
     var keep = rows.filter(function (r) { return r.verdict === 'keep' && r.next_check - now < 3600; });
     var keepCost = keep.reduce(function (a, r) { return a + 0.05 * r.prompt; }, 0);
     document.getElementById('livestats').innerHTML =

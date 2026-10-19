@@ -151,6 +151,15 @@ final class Bar: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let cp = (d["use_pct"] as? NSNumber)?.doubleValue {
                 m.addItem(row("Consumption", (cp < 0 ? "−" : "+") + String(format: "%.1f%%", abs(cp * 100)), "last 24 h vs the " + ((d["baseline_label"] as? String) ?? "default cache")))
             }
+            if let w = d["plan_week"] as? [String: Any] {
+                let used = String(format: "%.0f%% used", num(w, "used") * 100)
+                var tail = ""
+                if let est = (w["est"] as? NSNumber)?.doubleValue {
+                    if est >= 1, let hit = (w["hit_at"] as? NSNumber)?.doubleValue { tail = "without keep-alive: limit hit " + fmt(hit, "EEE HH:mm") }
+                    else { tail = String(format: "≈%.0f%% without keep-alive", est * 100) }
+                }
+                m.addItem(row("Plan, week", used, tail))
+            }
             m.addItem(row("Today", signed(num(today, "net")) + " · " + money(num(today, "net_usd")), "\(Int(num(today, "rescues"))) warm returns · \(Int(num(today, "pings"))) keep-alives"))
             let ratio = num(d24, "cost") > 0 ? String(format: "%.1f× return on cost", num(d24, "saved") / num(d24, "cost")) : ""
             m.addItem(row("Last 24 h", signed(num(d24, "net")) + " · " + money(num(d24, "net_usd")), ratio))

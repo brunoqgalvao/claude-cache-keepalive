@@ -103,6 +103,8 @@ Three pages, recomputed from the local logs (new log lines are read incrementall
 
 On macOS the installers also add a menu bar item: a bolt with today's net savings, so you can see at a glance that it is on and working. Its menu shows today, the last 24 hours and the total since install, the chats warm right now and when the next keep-alive is due, the last chat a keep-alive saved, and a link to the dashboard. When a return finds its cache warm, the item briefly shows what that saved. It is built from tools/menubar.swift with swiftc (Xcode command line tools); skip it with --no-menubar.
 
+With opencodex the overview also shows your Claude plan meters (this week and the 5-hour window, read from opencodex's own quota cache) and an estimate of where each would be without keep-alives: the meter's used share is spread over what this machine sent in that window, priced in token-equivalents with output at 5x, and the same requests are replayed under the cache you had before. If the replay crosses 100%, it shows when you would have hit the limit. It assumes the plan is only used through opencodex; with several accounts it shows the meters without an estimate.
+
 One conversation can carry several cache contexts (side requests, forks, compacted history); the dashboard follows each one separately, the way the cache and the keep-alive see them. With Codex, chat titles come from `~/.codex` on your machine (opencodex logs a hash of the thread id).
 
 ## What it sends and stores
