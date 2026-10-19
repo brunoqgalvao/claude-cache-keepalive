@@ -825,8 +825,8 @@ def api_badge(store):
 
 # ---------------------------------------------------------------- policy page (server-rendered)
 
-BASELINE = 'cc_1h' if (D / 'keepalive_proxy.py').exists() else 'old_5m'   # what you had before installing
-BASELINE_LABEL = {'old_5m': '5-minute cache (opencodex default)', 'cc_1h': '1-hour cache alone (Claude Code default)'}
+BASELINE = 'cc_1h'   # every comparison is against the 1-hour cache alone: what the keep-alive adds on top of it
+BASELINE_LABEL = {'old_5m': '5-minute cache (opencodex default)', 'cc_1h': '1-hour cache alone (no keep-alive)'}
 
 
 def replay(M):
@@ -883,15 +883,14 @@ def policy_html(store):
     pol, floor = M['pol'], M['floor']
     tot, u, daily = baselines(M)
     cards = ''
-    for key, label, sub in (('old_5m', '5-minute cache', 'every write 5 min (opencodex default)'),
-                            ('cc_1h', '1-hour cache only', 'every write 1 h, no keep-alive (Claude Code default)'),
+    for key, label, sub in (('cc_1h', '1-hour cache only', 'every write 1 h, no keep-alive (Claude Code default)'),
                             ('live', '1 h + keep-alive (live)', 'what actually happened, keep-alives included')):
         cards += f"""<div class="card"><div class="lbl">{label}</div><div class="sub">{sub}</div><div class="big">{fmt_tok(tot[key])}</div>
-<div class="sub">token-equivalents · ~{fmt_usd(u[key])} at API prices</div><div class="row">vs 5 min <b>{pct(tot[key], tot['old_5m'])}</b> · vs 1 h only <b>{pct(tot[key], tot['cc_1h'])}</b></div></div>"""
+<div class="sub">token-equivalents · ~{fmt_usd(u[key])} at API prices</div>{'' if key == 'cc_1h' else f'<div class="row">vs 1-hour cache alone <b>{pct(tot[key], tot["cc_1h"])}</b></div>'}</div>"""
     days = sorted(daily, key=lambda d: (d[3:], d[:2]))
     mx = max([max(daily[d].values() or [1]) for d in days] or [1])
     bars = ''.join("<div class='day'><div class='bars'>" + ''.join(
-        f"<div class='bar {k}' title='{k}: {fmt_tok(daily[d][k])}' style='height:{110 * daily[d][k] / mx:.0f}px'></div>" for k in ('old_5m', 'cc_1h', 'live'))
+        f"<div class='bar {k}' title='{k}: {fmt_tok(daily[d][k])}' style='height:{110 * daily[d][k] / mx:.0f}px'></div>" for k in ('cc_1h', 'live'))
         + f"</div><div class='sub'>{d}</div></div>" for d in days)
     hz = pol.get('hazard')
     mode = pol.get('mode', 'rule')
@@ -928,8 +927,8 @@ Daily cap {pol.get('daily_cap', '–')} keep-alives.</div></div>
 <p class="sub">Each cell: of the chats still idle about this long (row) at this size (column), how many you came back to within the next hour. Small grey number: how many cases it is based on. Green: above break-even for a typical chat of that size, so it keeps the cache. Sizes are total context.</p>
 <div class="card flush"><table class="hz"><tr><th>idle</th>{''.join(f'<th>{l}</th>' for l in labels)}</tr><tr><th>needed</th>{need_row}</tr>{rows}</table></div>"""
     return f"""<h2>The policy</h2>{head}{table}
-<h2>Cost under each cache rule</h2><p class="sub">Since {when(M['t0'])}, {tot['requests']:,} requests. The first two replay the same requests under that cache rule; input-side cost in base-input-token equivalents (1 h write 2×, 5 min write 1.25×, read 0.05× on Opus).</p><div class="cards">{cards}</div>
-<div class="legend sub" style="margin:4px 0 8px;display:block">Per day<span class="sw" style="background:#c7c7cc"></span>5 min<span class="sw" style="background:#8fb4f2"></span>1 h only<span class="sw" style="background:#2f6fdf"></span>live</div>
+<h2>1-hour cache alone vs with keep-alive</h2><p class="sub">Since {when(M['t0'])}, {tot['requests']:,} requests. The first replays the same requests with the 1-hour cache and no keep-alives; input-side cost in base-input-token equivalents (1 h write 2×, read 0.05× on Opus).</p><div class="cards">{cards}</div>
+<div class="legend sub" style="margin:4px 0 8px;display:block">Per day<span class="sw" style="background:#8fb4f2"></span>1 h only<span class="sw" style="background:#2f6fdf"></span>live</div>
 <div class="card daychart">{bars or '<div class="sub">No requests yet.</div>'}</div>"""
 
 
@@ -1143,7 +1142,7 @@ function drawChart(box, data, mode) {
 function useCard(d) {
   var c = d.consumption || {}, base = c[d.baseline] || 0, ch = base ? (c.live - base) / base : null, vs1 = c.cc_1h ? (c.live - c.cc_1h) / c.cc_1h : null;
   return '<div class="card kpi hl hero"><div class="lbl">Overall consumption</div><div class="big ' + (ch != null && ch <= 0 ? 'pos' : 'neg') + '">' + spct(ch) + '</div>' +
-    '<div class="sub">' + tok(c.live || 0) + ' used vs ' + tok(base) + ' with the ' + esc(d.baseline_label.split(' (')[0]) + ' you had before' +
+    '<div class="sub">' + tok(c.live || 0) + ' used vs ' + tok(base) + ' with the 1-hour cache and no keep-alive' +
     (d.baseline === 'old_5m' && vs1 != null ? ' · ' + spct(vs1) + ' vs the 1-hour cache alone' : '') + '</div></div>';
 }
 function weekday(t) { var d = new Date(t * 1000); return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()] + ' ' + clock(t); }
