@@ -490,7 +490,7 @@ def api_overview(store, rng):
     buckets = collections.OrderedDict()
     t = bucket_start(t_from, b)
     while t <= now:
-        buckets[t] = dict(t=t, saved=0.0, cost=0.0, missed=0.0, rescues=0, pings=0, missed_n=0)
+        buckets[t] = dict(t=t, saved=0.0, cost=0.0, missed=0.0, rescues=0, pings=0, missed_n=0, c_live=0.0, c_cc_1h=0.0, c_old_5m=0.0)
         t = bucket_start(t + b + 1, b) if b >= 86400 else t + b
     def slot(ts):
         return buckets.get(bucket_start(ts, b))
@@ -502,7 +502,7 @@ def api_overview(store, rng):
             tot['cost'] += d['cost']; tot['cost_usd'] += usd(d['cost'], d['model']); tot['pings'] += 1
             s = slot(d['t'])
             if s:
-                s['cost'] += d['cost']; s['pings'] += 1
+                s['cost'] += d['cost']; s['pings'] += 1; s['c_live'] += d['cost']
         elif d['kind'] == 'failed':
             tot['failed'] += 1
     reasons = collections.Counter()
@@ -522,14 +522,19 @@ def api_overview(store, rng):
             reasons[g['why'].split(':')[0]] += 1
             if s:
                 s['missed'] += g['best']; s['missed_n'] += 1
-    spend = 0.0
-    for k, rows in M['streams'].items():
-        m = rm(k[1])
-        for r in rows:
-            if r['t'] >= t_from:
-                spend += max(0, r['P'] - r['cr'] - r['cc']) + W60 * r['cc'] + m * r['cr']
-    spend += tot['cost']
-    return dict(now=now, range=rng, t_from=t_from, bucket=b, head=header(store, M), spend=spend,
+    use = collections.Counter()
+    for t, model, vals in replay(M):
+        if t < t_from:
+            continue
+        sl = slot(t)
+        for k, val in vals.items():
+            use[k] += val; use[k + '_usd'] += usd(val, model)
+            if sl:
+                sl['c_' + k] += val
+    use['live'] += tot['cost']; use['live_usd'] += tot['cost_usd']
+    spend = use['live']
+    return dict(now=now, range=rng, t_from=t_from, bucket=b, head=header(store, M), spend=spend, consumption=dict(use),
+                baseline=BASELINE, baseline_label=BASELINE_LABEL[BASELINE],
                 totals=dict(tot), reasons=reasons.most_common(), series=list(buckets.values()))
 
 
@@ -662,10 +667,12 @@ def api_badge(store):
             last = dict(t=ep['ret'], saved=g['saved'], title=titles.get(ep['cid'], {}).get('title'), away=ep['gap'])
     for c in out.values():
         c['net'] = c['saved'] - c['cost']; c['net_usd'] = c['saved_usd'] - c['cost_usd']
+    c24 = consumption(M, spans['d24'])
+    use_pct = (c24['live'] - c24[BASELINE]) / c24[BASELINE] if c24[BASELINE] else None
     live = api_live(store)
     due = [c['next_check'] for c in live['chats'] if c['verdict'] == 'keep']
     pings = [d['t'] for d in M['events'] if d['kind'] == 'kept']
-    return dict(now=now, on=M['disabled'] is None, disabled=(M['disabled'] or {}).get('reason'), mode=live['head']['mode'],
+    return dict(now=now, use_pct=use_pct, baseline_label=BASELINE_LABEL[BASELINE].split(' (')[0], on=M['disabled'] is None, disabled=(M['disabled'] or {}).get('reason'), mode=live['head']['mode'],
                 kind='Claude Code' if (D / 'keepalive_proxy.py').exists() else 'opencodex', since=M['t0'],
                 **{k: dict(v) for k, v in out.items()}, warm=len(live['chats']), warm_tokens=sum(c['prompt'] for c in live['chats']),
                 next_keepalive=min(due) if due else None, last_keepalive=max(pings) if pings else None, last_save=last)
@@ -673,30 +680,54 @@ def api_badge(store):
 
 # ---------------------------------------------------------------- policy page (server-rendered)
 
-def baselines(M):
-    """The same requests replayed under the 5-minute and 1-hour cache, next to what actually happened."""
+BASELINE = 'cc_1h' if (D / 'keepalive_proxy.py').exists() else 'old_5m'   # what you had before installing
+BASELINE_LABEL = {'old_5m': '5-minute cache (opencodex default)', 'cc_1h': '1-hour cache alone (Claude Code default)'}
+
+
+def replay(M):
+    """Every request since install, priced three ways: what actually happened (live), the same request under
+    the 1-hour cache without keep-alives, and under the 5-minute cache. A cold return re-reads only the
+    always-cached system prompt and tools (floor) and rewrites the rest. Keep-alive costs are added separately."""
     floor, t0 = M['floor'], M['t0']
-    day = lambda t: datetime.datetime.fromtimestamp(t, TZ).strftime('%d/%m')
-    tot, usd_tot, daily = collections.Counter(), collections.Counter(), collections.defaultdict(collections.Counter)
     for v in M['streams'].values():
         prev = None
         for r in v:
+            # skip each chat's first request after install: the one-time switch to the 1-hour cache
             if r['t'] >= t0 and not (prev is not None and prev['t'] < t0):
                 m = rm(r['model'])
                 u = max(0, r['P'] - r['cr'] - r['cc'])
                 gap = r['t'] - prev['t'] if prev else None
                 read_1h = min(r['cr'], floor) if gap is not None and gap > TTL + 30 else r['cr']
                 read_5m = min(r['cr'], floor) if gap is not None and gap > 300 else r['cr']
-                vals = {'live': u + W60 * r['cc'] + m * r['cr'], 'cc_1h': u + W60 * (r['P'] - u - read_1h) + m * read_1h,
-                        'old_5m': u + W5 * (r['P'] - u - read_5m) + m * read_5m}
-                for k, val in vals.items():
-                    tot[k] += val; usd_tot[k] += usd(val, r['model']); daily[day(r['t'])][k] += val
-                tot['requests'] += 1
+                yield r['t'], r['model'], {'live': u + W60 * r['cc'] + m * r['cr'], 'cc_1h': u + W60 * (r['P'] - u - read_1h) + m * read_1h,
+                                           'old_5m': u + W5 * (r['P'] - u - read_5m) + m * read_5m}
             prev = r
+
+
+def baselines(M):
+    """The same requests replayed under the 5-minute and 1-hour cache, next to what actually happened."""
+    day = lambda t: datetime.datetime.fromtimestamp(t, TZ).strftime('%d/%m')
+    tot, usd_tot, daily = collections.Counter(), collections.Counter(), collections.defaultdict(collections.Counter)
+    for t, model, vals in replay(M):
+        for k, val in vals.items():
+            tot[k] += val; usd_tot[k] += usd(val, model); daily[day(t)][k] += val
+        tot['requests'] += 1
     for d in M['events']:
         if d['kind'] == 'kept':
             tot['live'] += d['cost']; usd_tot['live'] += usd(d['cost'], d['model']); daily[day(d['t'])]['live'] += d['cost']
     return tot, usd_tot, daily
+
+
+def consumption(M, t_from):
+    c = collections.Counter()
+    for t, model, vals in replay(M):
+        if t >= t_from:
+            for k, val in vals.items():
+                c[k] += val; c[k + '_usd'] += usd(val, model)
+    for d in M['events']:
+        if d['kind'] == 'kept' and d['t'] >= t_from:
+            c['live'] += d['cost']; c['live_usd'] += usd(d['cost'], d['model'])
+    return c
 
 
 def pct(a, b): return f"{100 * (a - b) / b:+.1f}%" if b else '–'
@@ -868,6 +899,7 @@ function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function
 function tok(x) { var a = Math.abs(x); if (a >= 1e9) return (x / 1e9).toFixed(2) + 'B'; if (a >= 1e6) return (x / 1e6).toFixed(a >= 1e8 ? 0 : 1) + 'M'; if (a >= 1e3) return Math.round(x / 1e3) + 'k'; return Math.round(x) + ''; }
 function stok(x) { return (x > 0 ? '+' : x < 0 ? '−' : '') + tok(Math.abs(x)); }
 function usd(x) { var a = Math.abs(x); return (x < 0 ? '−' : '') + 'US$ ' + (a >= 10 ? Math.round(a).toLocaleString('en-US') : a.toFixed(2)); }
+function spct(x) { return x == null ? '–' : (x < 0 ? '−' : '+') + Math.abs(100 * x).toFixed(1) + '%'; }
 function pct(x, d) { return x == null ? '–' : (100 * x).toFixed(d == null ? 1 : d) + '%'; }
 function pad(n) { return (n < 10 ? '0' : '') + n; }
 function clock(t) { var d = new Date(t * 1000); return pad(d.getHours()) + ':' + pad(d.getMinutes()); }
@@ -900,8 +932,10 @@ function drawChart(box, data, mode) {
   var n = s.length, iw = W - L - R, ih = H - T - B;
   if (!n) { box.innerHTML = '<div class="empty">No data in this window.</div>'; return; }
   var cs = 0, cc = 0, cum = s.map(function (b) { cs += b.saved; cc += b.cost; return {s: cs, c: cc, n: cs - cc}; });
+  var u5 = 0, u1 = 0, ul = 0, use = s.map(function (b) { u5 += b.c_old_5m; u1 += b.c_cc_1h; ul += b.c_live; return {a: u5, b: u1, l: ul}; });
   var lo, hi;
-  if (mode === 'cum') { hi = niceMax(Math.max(cs, cc, 1)); lo = Math.min(0, Math.min.apply(null, cum.map(function (c) { return c.n; }))); if (lo < 0) lo = -niceMax(-lo); }
+  if (mode === 'use') { lo = 0; hi = niceMax(Math.max(data.baseline === 'old_5m' ? u5 : 0, u1, ul, 1)); }
+  else if (mode === 'cum') { hi = niceMax(Math.max(cs, cc, 1)); lo = Math.min(0, Math.min.apply(null, cum.map(function (c) { return c.n; }))); if (lo < 0) lo = -niceMax(-lo); }
   else { hi = niceMax(Math.max.apply(null, s.map(function (b) { return b.saved; }).concat([1]))); lo = -niceMax(Math.max.apply(null, s.map(function (b) { return b.cost; }).concat([1]))); }
   var y = function (v) { return T + ih * (hi - v) / (hi - lo); };
   var bw = iw / n, x = function (i) { return L + bw * (i + 0.5); };
@@ -911,7 +945,14 @@ function drawChart(box, data, mode) {
   var every = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(iw / 78))));
   var long = data.bucket >= 86400 || (s[n - 1].t - s[0].t) > 1.5 * 86400;
   s.forEach(function (b, i) { if (i % every) return; var lab = data.bucket >= 86400 ? day(b.t) : (long && new Date(b.t * 1000).getHours() < data.bucket / 3600 ? day(b.t) : clock(b.t)); g += '<text x="' + x(i) + '" y="' + (H - 6) + '" text-anchor="middle">' + lab + '</text>'; });
-  if (mode === 'cum') {
+  if (mode === 'use') {
+    var up = function (k) { return use.map(function (c, i) { return x(i).toFixed(1) + ',' + y(c[k]).toFixed(1); }).join(' '); };
+    var bk = data.baseline === 'old_5m' ? 'a' : 'b';
+    g += '<polygon points="' + x(0) + ',' + y(0) + ' ' + up(bk) + ' ' + use.slice().reverse().map(function (c, j) { var i = n - 1 - j; return x(i).toFixed(1) + ',' + y(c.l).toFixed(1); }).join(' ') + '" fill="rgba(31,138,76,.10)"/>';
+    if (data.baseline === 'old_5m') g += '<polyline points="' + up('a') + '" fill="none" stroke="#8e8e93" stroke-width="2" stroke-dasharray="5 4" stroke-linejoin="round"/>';
+    g += '<polyline points="' + up('b') + '" fill="none" stroke="#8fb4f2" stroke-width="2" stroke-linejoin="round"/>';
+    g += '<polyline points="' + up('l') + '" fill="none" stroke="#2f6fdf" stroke-width="2.5" stroke-linejoin="round"/>';
+  } else if (mode === 'cum') {
     var pts = function (k) { return cum.map(function (c, i) { return x(i).toFixed(1) + ',' + y(c[k]).toFixed(1); }).join(' '); };
     g += '<polygon points="' + x(0) + ',' + y(0) + ' ' + pts('n') + ' ' + x(n - 1) + ',' + y(0) + '" fill="rgba(47,111,223,.08)"/>';
     g += '<polyline points="' + pts('s') + '" fill="none" stroke="#1f8a4c" stroke-width="2" stroke-linejoin="round"/>';
@@ -932,6 +973,7 @@ function drawChart(box, data, mode) {
     var r = box.getBoundingClientRect(), px = (ev.clientX - r.left) * W / r.width, i = Math.max(0, Math.min(n - 1, Math.floor((px - L) / bw))), b = s[i], c = cum[i];
     hov.setAttribute('x1', x(i)); hov.setAttribute('x2', x(i)); hov.style.display = '';
     var end = b.t + data.bucket, lab = data.bucket >= 86400 ? day(b.t) : day(b.t) + ' ' + clock(b.t) + '–' + clock(end);
+    if (mode === 'use') { var u = use[i], ub = data.baseline === 'old_5m' ? u.a : u.b; tip.innerHTML = '<div style="opacity:.7">' + lab + ' · so far</div>Used <b>' + tok(u.l) + '</b>' + (ub ? ' · <b style="color:#7ee2a1">' + spct((u.l - ub) / ub) + '</b>' : '') + '<br><span style="opacity:.75">' + (data.baseline === 'old_5m' ? '5-minute cache <b>' + tok(u.a) + '</b><br>' : '') + '1-hour cache only <b>' + tok(u.b) + '</b></span>'; } else
     tip.innerHTML = '<div style="opacity:.7">' + lab + '</div><span class="pos" style="color:#7ee2a1">Saved <b>' + tok(b.saved) + '</b></span> · ' + b.rescues + ' warm return' + (b.rescues === 1 ? '' : 's') + '<br><span style="color:#ffb38a">Cost <b>' + tok(b.cost) + '</b></span> · ' + b.pings + ' keep-alive' + (b.pings === 1 ? '' : 's') + (b.missed ? '<br><span style="color:#ffd27a">Missed <b>' + tok(b.missed) + '</b></span> · ' + b.missed_n + ' cold return' + (b.missed_n === 1 ? '' : 's') : '') + '<br>Net so far <b>' + stok(c.n) + '</b>';
     tip.style.opacity = 1;
     var tx = x(i) * r.width / W + 14; if (tx > r.width - 230) tx = x(i) * r.width / W - 230;
@@ -941,18 +983,25 @@ function drawChart(box, data, mode) {
 }
 
 /* ---------- overview ---------- */
+function useCard(d) {
+  var c = d.consumption || {}, base = c[d.baseline] || 0, ch = base ? (c.live - base) / base : null, vs1 = c.cc_1h ? (c.live - c.cc_1h) / c.cc_1h : null;
+  return '<div class="card kpi hl"><div class="lbl">Overall consumption</div><div class="big ' + (ch != null && ch <= 0 ? 'pos' : 'neg') + '">' + spct(ch) + '</div>' +
+    '<div class="sub">' + tok(c.live || 0) + ' used vs ' + tok(base) + ' with the ' + esc(d.baseline_label.split(' (')[0]) + ' you had before' +
+    (d.baseline === 'old_5m' && vs1 != null ? ' · ' + spct(vs1) + ' vs the 1-hour cache alone' : '') + '</div></div>';
+}
 function overview() {
   var app = document.getElementById('app');
   app.innerHTML = '<div class="bar-row"><div class="seg" id="range"></div><span class="sub" id="span"></span></div><div id="kpis" class="kpis"></div>' +
-    '<div class="card chartcard"><div class="charthead"><b style="font-size:13px">Savings vs cost</b><div class="seg" id="mode"></div><div class="legend" id="legend"></div></div><div class="chart" id="chart"></div></div>' +
+    '<div class="card chartcard"><div class="charthead"><b style="font-size:13px" id="ctitle"></b><div class="seg" id="mode"></div><div class="legend" id="legend"></div></div><div class="chart" id="chart"></div></div>' +
     '<h2>On cache now</h2><p class="sub">Chats whose 1-hour cache is still warm. About a minute before it expires the keep-alive checks the chat: if the chance you come back within the next hour beats break-even it re-reads the cache (cheap), otherwise it lets it expire. Updates every 30 s.</p>' +
     '<div class="stats" id="livestats"></div><div class="card flush tablecard" id="live"></div><div id="expired"></div>';
-  var range = param('range', '24h'), mode = param('chart', 'cum'), last = null;
+  var range = param('range', '24h'), mode = param('chart', 'use'), last = null;
   seg(document.getElementById('range'), RANGES, range, function (k) { range = k; setParam('range', k); load(); });
-  seg(document.getElementById('mode'), [['cum', 'Cumulative'], ['bars', 'Per period']], mode, function (k) { mode = k; setParam('chart', k); paint(); });
+  seg(document.getElementById('mode'), [['use', 'Consumption'], ['cum', 'Savings'], ['bars', 'Savings per period']], mode, function (k) { mode = k; setParam('chart', k); paint(); });
   function paint() {
     if (!last) return;
-    document.getElementById('legend').innerHTML = mode === 'cum' ? '<span><i style="background:#1f8a4c"></i>Rewrites avoided</span><span><i style="background:#c2410c"></i>Keep-alive cost</span><span><i style="background:#2f6fdf"></i>Net</span>' : '<span><i style="background:#1f8a4c"></i>Rewrites avoided</span><span><i style="background:#e08a5e"></i>Keep-alive cost</span>';
+    document.getElementById('ctitle').textContent = mode === 'use' ? 'Tokens used, cumulative' : 'Savings vs cost';
+    document.getElementById('legend').innerHTML = mode === 'use' ? '<span><i style="background:#2f6fdf"></i>Actual (keep-alive costs included)</span><span><i style="background:#8fb4f2"></i>1-hour cache alone</span>' + (last.baseline === 'old_5m' ? '<span><i style="background:#8e8e93"></i>5-minute cache (before)</span>' : '') : mode === 'cum' ? '<span><i style="background:#1f8a4c"></i>Rewrites avoided</span><span><i style="background:#c2410c"></i>Keep-alive cost</span><span><i style="background:#2f6fdf"></i>Net</span>' : '<span><i style="background:#1f8a4c"></i>Rewrites avoided</span><span><i style="background:#e08a5e"></i>Keep-alive cost</span>';
     drawChart(document.getElementById('chart'), last, mode);
   }
   function load() {
@@ -963,7 +1012,7 @@ function overview() {
       document.getElementById('span').textContent = when(d.t_from) + ' → now · ' + (d.bucket >= 86400 ? 'daily' : dur(d.bucket)) + ' buckets';
       var k = document.getElementById('kpis'); k.classList.remove('loading');
       k.innerHTML =
-        '<div class="card kpi hl"><div class="lbl">Net saved</div><div class="big ' + (net >= 0 ? 'blue' : 'neg') + '">' + stok(net) + '</div><div class="sub">' + usd(netu) + ' at API prices · ' + (cost ? (saved / cost).toFixed(1) + '× return on cost' : 'no keep-alives yet') + (d.spend ? ' · ' + pct(net / d.spend) + ' of input spend' : '') + '</div></div>' +
+        useCard(d) + '<div class="card kpi"><div class="lbl">Net saved</div><div class="big ' + (net >= 0 ? 'blue' : 'neg') + '">' + stok(net) + '</div><div class="sub">' + usd(netu) + ' at API prices · ' + (cost ? (saved / cost).toFixed(1) + '× return on cost' : 'no keep-alives yet') + (d.spend ? ' · ' + pct(net / d.spend) + ' of input spend' : '') + '</div></div>' +
         '<div class="card kpi"><div class="lbl">Rewrites avoided</div><div class="big pos">' + tok(saved) + '</div><div class="sub">' + (t.rescues || 0) + ' time' + (t.rescues === 1 ? '' : 's') + ' you came back after an hour+ to a warm cache · ' + usd(t.saved_usd || 0) + '</div></div>' +
         '<div class="card kpi"><div class="lbl">Keep-alive cost</div><div class="big neg">' + tok(cost) + '</div><div class="sub">' + (t.pings || 0) + ' keep-alives' + (t.failed ? ', ' + t.failed + ' failed' : '') + ' · ' + usd(t.cost_usd || 0) + '</div></div>' +
         '<div class="card kpi"><div class="lbl">Left on the table</div><div class="big" style="color:var(--amber)">' + tok(t.missed || 0) + '</div><div class="sub"><a href="/decisions?range=' + range + '&f=missed">' + (t.missed_n || 0) + ' cold return' + (t.missed_n === 1 ? '' : 's') + '</a> where a keep-alive would have paid' + (d.reasons.length ? ' · mostly ' + esc(d.reasons[0][0]) : '') + '</div></div>';

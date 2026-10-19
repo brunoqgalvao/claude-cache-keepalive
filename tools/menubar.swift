@@ -148,6 +148,9 @@ final class Bar: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 m.addItem(open)
                 continue
             }
+            if let cp = (d["use_pct"] as? NSNumber)?.doubleValue {
+                m.addItem(row("Consumption", (cp < 0 ? "−" : "+") + String(format: "%.1f%%", abs(cp * 100)), "last 24 h vs the " + ((d["baseline_label"] as? String) ?? "default cache")))
+            }
             m.addItem(row("Today", signed(num(today, "net")) + " · " + money(num(today, "net_usd")), "\(Int(num(today, "rescues"))) warm returns · \(Int(num(today, "pings"))) keep-alives"))
             let ratio = num(d24, "cost") > 0 ? String(format: "%.1f× return on cost", num(d24, "saved") / num(d24, "cost")) : ""
             m.addItem(row("Last 24 h", signed(num(d24, "net")) + " · " + money(num(d24, "net_usd")), ratio))
