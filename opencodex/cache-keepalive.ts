@@ -137,11 +137,15 @@ function underDailyCap(p: Policy): boolean {
   return today.pings < p.daily_cap;
 }
 
-/** Conversation identity: model + system + the first two messages, which stay fixed as it grows. */
-export function keepaliveKey(model: string, body: Record<string, unknown>): string | undefined {
+/** Conversation identity: model + Codex thread id + system + the first two messages, which stay fixed as it grows.
+ *  The thread id matters: many Codex chats open with the same instructions, so without it different
+ *  chats shared a key and the one that finished last replaced the others, which were then never kept
+ *  alive. A compaction inside one chat changes the opening, so it still gets its own key. */
+export function keepaliveKey(model: string, body: Record<string, unknown>, thread?: string): string | undefined {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   if (messages.length === 0) return undefined;
-  return createHash("sha256").update(JSON.stringify([model, body.system ?? null, messages.slice(0, 2)])).digest("hex").slice(0, 32);
+  const parts = thread ? [model, thread, body.system ?? null, messages.slice(0, 2)] : [model, body.system ?? null, messages.slice(0, 2)];
+  return createHash("sha256").update(JSON.stringify(parts)).digest("hex").slice(0, 32);
 }
 
 /** Called by the Anthropic adapter right before a request is sent. */
@@ -153,10 +157,11 @@ export function keepaliveCapture(input: {
   body: Record<string, unknown>;
   serialized: string;
   token: string | undefined;
+  thread?: string;
 }): KeepaliveCapture | undefined {
   try {
     if (disabled() || input.retention !== "long" || !input.token) return undefined;
-    const key = keepaliveKey(input.model, input.body);
+    const key = keepaliveKey(input.model, input.body, typeof input.thread === "string" && input.thread ? input.thread : undefined);
     if (!key) return undefined;
     const existing = convs.get(key);
     if (existing?.timer) { clearTimeout(existing.timer); existing.timer = undefined; }

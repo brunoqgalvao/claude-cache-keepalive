@@ -120,7 +120,7 @@ python3 claude-code/install.py --uninstall
 ## Caveats
 
 - One user's traffic. Your pauses decide whether this pays; that's why it tunes on your log and monitors itself.
-- A chat is identified by its model, system prompt and first two messages. If the start of a conversation changes (for example an edited instructions file), the old cache stops matching; the keep-alive notices (the re-read comes back small) and stops for that chat.
+- A chat is identified by its model, its thread (the Codex thread id, or Claude Code's session id), system prompt and first two messages. Earlier versions left out the thread, so chats that opened with the same instructions shared a key and only the last one used was kept alive; rerun the installer to get the fix. If the start of a conversation changes (for example an edited instructions file), the old cache stops matching; the keep-alive notices (the re-read comes back small) and stops for that chat.
 - The opencodex patch edits installed source. It is small and marked with `// claude-cache-keepalive`, but read it before running it.
 
 MIT license.

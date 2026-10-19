@@ -71,7 +71,10 @@ def conv_key(body):
     msgs = body.get('messages') or []
     if not msgs:
         return None
-    return hashlib.sha256(json.dumps([body.get('model'), body.get('system'), msgs[:2]], sort_keys=True).encode()).hexdigest()[:32]
+    # metadata.user_id carries Claude Code's session id, which keeps sessions with the same opening apart
+    session = (body.get('metadata') or {}).get('user_id') if isinstance(body.get('metadata'), dict) else None
+    parts = [body.get('model'), session, body.get('system'), msgs[:2]] if session else [body.get('model'), body.get('system'), msgs[:2]]
+    return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()[:32]
 
 def uses_1h(body):
     return '"ttl": "1h"' in json.dumps(body) or '"ttl":"1h"' in json.dumps(body, separators=(',', ':'))

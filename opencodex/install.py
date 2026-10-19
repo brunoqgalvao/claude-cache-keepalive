@@ -44,6 +44,10 @@ def patch_adapter(src):
     p = src / 'adapters' / 'anthropic.ts'
     s = p.read_text()
     if 'keepaliveCapture' in s:
+        # earlier versions keyed chats without the Codex thread id; add it to an existing hook
+        if 'keepaliveCapture({ retention:' in s and '_clientThreadId' not in s.split('keepaliveCapture({', 1)[1][:200]:
+            p.write_text(s.replace('keepaliveCapture({ retention:', 'keepaliveCapture({ thread: parsed._clientThreadId, retention:', 1))
+            return 'already patched; added the thread id to the keep-alive key'
         return 'already patched'
     orig = s
     for need in ('usesNativeAnthropicEndpoint(', 'isOAuth', 'pendingStopReason', 'normalizeTtlOrdering(body);'):
@@ -62,7 +66,7 @@ def patch_adapter(src):
     ind = m.group(1)
     hook = (ind + 'const keepaliveBody = JSON.stringify(body);' + TAG + '\n'
             + ind + 'keepalive = isOAuth && usesNativeAnthropicEndpoint(provider)\n'
-            + ind + '  ? keepaliveCapture({ retention: cacheRetention, model: parsed.modelId, url, headers, body, serialized: keepaliveBody, token: provider.apiKey })\n'
+            + ind + '  ? keepaliveCapture({ thread: parsed._clientThreadId, retention: cacheRetention, model: parsed.modelId, url, headers, body, serialized: keepaliveBody, token: provider.apiKey })\n'
             + ind + '  : undefined;\n')
     s = s[:m.end()] + hook + s[m.end():]
     n = s.find('body: JSON.stringify(body),', m.end())
